@@ -41,12 +41,17 @@ export interface RankingConfig {
     dedupSimilarityThreshold: number;
 }
 
+export interface SessionConfig {
+    autoStartOnBoot: boolean;
+}
+
 export interface LatentContextConfig {
     storage: StorageConfig;
     embedding: EmbeddingConfig;
     tokenBudgets: TokenBudgetConfig;
     compression: CompressionConfig;
     ranking: RankingConfig;
+    session: SessionConfig;
 }
 
 // ---------------------------------------------------------------------------
@@ -84,6 +89,9 @@ const DEFAULT_CONFIG: LatentContextConfig = {
         priorityWeight: 0.2,
         frequencyWeight: 0.1,
         dedupSimilarityThreshold: 0.85,
+    },
+    session: {
+        autoStartOnBoot: true,
     },
 };
 

@@ -61,6 +61,13 @@ export interface AccessLogRow {
     accessed_at: string;
 }
 
+export interface SessionRow {
+    id: string;
+    started_at: string;
+    ended_at: string | null;
+    metadata: string; // JSON
+}
+
 // ---------------------------------------------------------------------------
 // Schema
 // ---------------------------------------------------------------------------
@@ -119,6 +126,13 @@ CREATE TABLE IF NOT EXISTS access_log (
     memory_type TEXT NOT NULL,
     accessed_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    metadata TEXT NOT NULL DEFAULT '{}'
+);
 `;
 
 const INDEXES_SQL = `
@@ -132,6 +146,7 @@ CREATE INDEX IF NOT EXISTS idx_summaries_session ON summaries(session_id);
 CREATE INDEX IF NOT EXISTS idx_vectors_source ON vectors(source_id);
 CREATE INDEX IF NOT EXISTS idx_vectors_source_type ON vectors(source_type);
 CREATE INDEX IF NOT EXISTS idx_access_log_memory ON access_log(memory_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at);
 `;
 
 // ---------------------------------------------------------------------------
@@ -517,6 +532,20 @@ export function getSummariesByTier(tier: number): SummaryRow[] {
     );
 }
 
+export function getSummariesByTierAndSession(tier: number, sessionId: string): SummaryRow[] {
+    return queryAll<SummaryRow>(
+        "SELECT * FROM summaries WHERE tier = ? AND session_id = ? ORDER BY created_at DESC",
+        [tier, sessionId]
+    );
+}
+
+export function getSummariesByTierExcludingSession(tier: number, sessionId: string): SummaryRow[] {
+    return queryAll<SummaryRow>(
+        "SELECT * FROM summaries WHERE tier = ? AND (session_id IS NULL OR session_id != ?) ORDER BY created_at DESC",
+        [tier, sessionId]
+    );
+}
+
 export function getSummaryById(id: string): SummaryRow | undefined {
     return queryOne<SummaryRow>("SELECT * FROM summaries WHERE id = ?", [id]);
 }
@@ -671,4 +700,47 @@ export function wipeAllData(): void {
     runSql("DELETE FROM relations");
     runSql("DELETE FROM summaries");
     runSql("DELETE FROM entities");
+    runSql("DELETE FROM sessions");
+}
+
+// ---------------------------------------------------------------------------
+// Session operations
+// ---------------------------------------------------------------------------
+
+export function insertSession(session: SessionRow): void {
+    runSql(
+        `INSERT INTO sessions (id, started_at, ended_at, metadata)
+     VALUES (?, ?, ?, ?)`,
+        [
+            session.id,
+            session.started_at,
+            session.ended_at ?? null,
+            session.metadata,
+        ]
+    );
+}
+
+export function endSessionRecord(sessionId: string): void {
+    const ts = now();
+    runSql(
+        "UPDATE sessions SET ended_at = ? WHERE id = ?",
+        [ts, sessionId]
+    );
+}
+
+export function getSessionById(sessionId: string): SessionRow | undefined {
+    return queryOne<SessionRow>("SELECT * FROM sessions WHERE id = ?", [sessionId]);
+}
+
+export function getRecentSessions(limit: number = 10): SessionRow[] {
+    return queryAll<SessionRow>(
+        "SELECT * FROM sessions ORDER BY started_at DESC LIMIT ?",
+        [limit]
+    );
+}
+
+export function getActiveSession(): SessionRow | undefined {
+    return queryOne<SessionRow>(
+        "SELECT * FROM sessions WHERE ended_at IS NULL ORDER BY started_at DESC LIMIT 1"
+    );
 }

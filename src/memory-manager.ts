@@ -3,6 +3,8 @@ import { getConfig } from "./config.js";
 import {
     insertSummary,
     getSummariesByTier,
+    getSummariesByTierAndSession,
+    getSummariesByTierExcludingSession,
     getSummaryById,
     updateSummaryContent,
     deleteSummary,
@@ -25,6 +27,7 @@ import {
     getVectorStoreCount,
 } from "./vector-store.js";
 import { countTokens, truncateToTokenBudget } from "./token-counter.js";
+import { getCurrentSessionIdOrNull } from "./session.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -41,6 +44,7 @@ export interface StoreResult {
     entitiesCreated: string[];
     factsStored: number;
     vectorId: string | null;
+    sessionId: string | null;
 }
 
 export interface MemoryStatus {
@@ -53,6 +57,7 @@ export interface MemoryStatus {
     knowledgeGraph: { entities: number; relations: number };
     vectorStore: { count: number };
     totalTokensStored: number;
+    currentSessionId: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -64,6 +69,7 @@ interface WorkingMemoryEntry {
     content: string;
     tokens: number;
     timestamp: string;
+    sessionId: string | null;
 }
 
 const _workingMemory: WorkingMemoryEntry[] = [];
@@ -72,31 +78,127 @@ function getWorkingMemoryTokens(): number {
     return _workingMemory.reduce((sum, entry) => sum + entry.tokens, 0);
 }
 
+function getSessionWorkingMemoryTokens(sessionId: string | null): number {
+    if (!sessionId) return getWorkingMemoryTokens();
+    return _workingMemory
+        .filter((e) => e.sessionId === sessionId)
+        .reduce((sum, entry) => sum + entry.tokens, 0);
+}
+
 function addToWorkingMemory(content: string): string {
     const id = uuidv4();
     const tokens = countTokens(content);
+    const sessionId = getCurrentSessionIdOrNull();
     _workingMemory.push({
         id,
         content,
         tokens,
         timestamp: new Date().toISOString(),
+        sessionId,
     });
     return id;
 }
 
 /**
- * Get the current working memory as text.
+ * Get the current session's working memory as text.
  */
 export function getWorkingMemory(): string {
+    const sessionId = getCurrentSessionIdOrNull();
+    const entries = sessionId
+        ? _workingMemory.filter((e) => e.sessionId === sessionId)
+        : _workingMemory;
+    if (entries.length === 0) return "";
+    return entries.map((e) => e.content).join("\n");
+}
+
+/**
+ * Get ALL working memory as text (regardless of session).
+ */
+export function getAllWorkingMemory(): string {
     if (_workingMemory.length === 0) return "";
     return _workingMemory.map((e) => e.content).join("\n");
 }
 
 /**
- * Get working memory entries count.
+ * Get working memory entries count for the current session.
  */
 export function getWorkingMemoryCount(): number {
-    return _workingMemory.length;
+    const sessionId = getCurrentSessionIdOrNull();
+    if (!sessionId) return _workingMemory.length;
+    return _workingMemory.filter((e) => e.sessionId === sessionId).length;
+}
+
+/**
+ * Archive all current session working memory into a Tier 1 summary.
+ * Called during session transitions to preserve data before clearing.
+ * Returns the archive summary text, or null if nothing to archive.
+ */
+export async function archiveWorkingMemory(sessionId: string): Promise<string | null> {
+    const config = getConfig();
+
+    // Get entries for this session only
+    const sessionEntries = _workingMemory.filter((e) => e.sessionId === sessionId);
+    if (sessionEntries.length === 0) return null;
+
+    const combinedContent = sessionEntries.map((e) => e.content).join("\n");
+    const originalTokens = sessionEntries.reduce((s, e) => s + e.tokens, 0);
+
+    const { text: compressed } = truncateToTokenBudget(
+        combinedContent,
+        config.tokenBudgets.tier1Session
+    );
+
+    const summaryId = uuidv4();
+    const compressedTokens = countTokens(compressed);
+
+    insertSummary({
+        id: summaryId,
+        tier: 1,
+        content: compressed,
+        token_count: compressedTokens,
+        session_id: sessionId,
+        source_ids: JSON.stringify(sessionEntries.map((e) => e.id)),
+        metadata: JSON.stringify({
+            type: "session_archive",
+            originalCount: sessionEntries.length,
+            originalTokens,
+            sessionId,
+        }),
+    });
+
+    // Embed the archive for vector search
+    try {
+        await addToVectorStore(compressed, summaryId, "summary", 0.9, {
+            sessionArchive: true,
+            sessionId,
+        });
+    } catch {
+        // non-fatal
+    }
+
+    // Remove archived entries from working memory
+    const archiveIds = new Set(sessionEntries.map((e) => e.id));
+    const remaining = _workingMemory.filter((e) => !archiveIds.has(e.id));
+    _workingMemory.length = 0;
+    _workingMemory.push(...remaining);
+
+    return `Archived ${sessionEntries.length} entries (${originalTokens} tokens) → Tier 1 summary (${compressedTokens} tokens)`;
+}
+
+/**
+ * Clear all working memory entries for the current session.
+ */
+export function clearSessionWorkingMemory(sessionId: string): void {
+    const remaining = _workingMemory.filter((e) => e.sessionId !== sessionId);
+    _workingMemory.length = 0;
+    _workingMemory.push(...remaining);
+}
+
+/**
+ * Clear ALL working memory regardless of session.
+ */
+export function clearAllWorkingMemory(): void {
+    _workingMemory.length = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -114,6 +216,7 @@ export async function storeMemory(
     entities: string[] = []
 ): Promise<StoreResult> {
     const config = getConfig();
+    const sessionId = getCurrentSessionIdOrNull();
     const result: StoreResult = {
         memoryId: "",
         memoryType,
@@ -121,6 +224,7 @@ export async function storeMemory(
         entitiesCreated: [],
         factsStored: 0,
         vectorId: null,
+        sessionId,
     };
 
     switch (memoryType) {
@@ -133,9 +237,9 @@ export async function storeMemory(
                 tier: 3,
                 content,
                 token_count: tokens,
-                session_id: null,
+                session_id: sessionId,
                 source_ids: "[]",
-                metadata: JSON.stringify({ type: "core", entities }),
+                metadata: JSON.stringify({ type: "core", entities, sessionId }),
             });
             result.memoryId = summaryId;
             result.tier = 3;
@@ -147,7 +251,7 @@ export async function storeMemory(
                     summaryId,
                     "core",
                     confidence,
-                    { memoryType: "core", entities }
+                    { memoryType: "core", entities, sessionId }
                 );
             } catch {
                 // Embedding failure is non-fatal
@@ -189,12 +293,13 @@ export async function storeMemory(
                 tier: 1,
                 content,
                 token_count: tokens,
-                session_id: null,
+                session_id: sessionId,
                 source_ids: JSON.stringify(entities),
                 metadata: JSON.stringify({
                     type: "fact",
                     entities,
                     confidence,
+                    sessionId,
                 }),
             });
 
@@ -205,7 +310,7 @@ export async function storeMemory(
                     factId,
                     "fact",
                     confidence,
-                    { memoryType: "fact", entities }
+                    { memoryType: "fact", entities, sessionId }
                 );
             } catch {
                 // Embedding failure is non-fatal
@@ -235,9 +340,9 @@ export async function storeMemory(
                 tier: 2,
                 content,
                 token_count: tokens,
-                session_id: null,
+                session_id: sessionId,
                 source_ids: JSON.stringify(entities),
-                metadata: JSON.stringify({ type: "preference", entities }),
+                metadata: JSON.stringify({ type: "preference", entities, sessionId }),
             });
 
             try {
@@ -246,7 +351,7 @@ export async function storeMemory(
                     prefId,
                     "preference",
                     confidence,
-                    { memoryType: "preference", entities }
+                    { memoryType: "preference", entities, sessionId }
                 );
             } catch {
                 // non-fatal
@@ -272,7 +377,7 @@ export async function storeMemory(
                     eventId,
                     "event",
                     confidence,
-                    { memoryType: "event", entities, timestamp: new Date().toISOString() }
+                    { memoryType: "event", entities, timestamp: new Date().toISOString(), sessionId }
                 );
             } catch {
                 // non-fatal
@@ -296,9 +401,9 @@ export async function storeMemory(
                 tier: 1,
                 content,
                 token_count: tokens,
-                session_id: null,
+                session_id: sessionId,
                 source_ids: JSON.stringify(entities),
-                metadata: JSON.stringify({ type: "summary", entities }),
+                metadata: JSON.stringify({ type: "summary", entities, sessionId }),
             });
 
             try {
@@ -307,7 +412,7 @@ export async function storeMemory(
                     sumId,
                     "summary",
                     confidence,
-                    { memoryType: "summary", entities }
+                    { memoryType: "summary", entities, sessionId }
                 );
             } catch {
                 // non-fatal
@@ -332,21 +437,33 @@ export async function storeMemory(
  */
 async function checkTier0Overflow(): Promise<void> {
     const config = getConfig();
-    const currentTokens = getWorkingMemoryTokens();
+    const sessionId = getCurrentSessionIdOrNull();
+    const currentTokens = sessionId
+        ? getSessionWorkingMemoryTokens(sessionId)
+        : getWorkingMemoryTokens();
 
     if (currentTokens <= config.compression.tier0OverflowThreshold) return;
 
+    // Get entries for the current session
+    const sessionEntries = sessionId
+        ? _workingMemory.filter((e) => e.sessionId === sessionId)
+        : _workingMemory;
+
     // Compress the oldest half of working memory into a Tier 1 summary
-    const halfIdx = Math.floor(_workingMemory.length / 2);
-    const toCompress = _workingMemory.splice(0, halfIdx);
+    const halfIdx = Math.floor(sessionEntries.length / 2);
+    const toCompress = sessionEntries.slice(0, halfIdx);
 
     if (toCompress.length === 0) return;
+
+    // Remove compressed entries from the main array
+    const compressIds = new Set(toCompress.map((e) => e.id));
+    const remaining = _workingMemory.filter((e) => !compressIds.has(e.id));
+    _workingMemory.length = 0;
+    _workingMemory.push(...remaining);
 
     const combinedContent = toCompress.map((e) => e.content).join("\n");
 
     // Create a compressed Tier 1 summary
-    // Note: Ideally the LLM would do the summarization via the compress_session prompt.
-    // For automatic overflow, we do a simple truncation-based compression.
     const { text: compressed } = truncateToTokenBudget(
         combinedContent,
         config.tokenBudgets.tier1Session
@@ -360,12 +477,13 @@ async function checkTier0Overflow(): Promise<void> {
         tier: 1,
         content: compressed,
         token_count: tokens,
-        session_id: null,
+        session_id: sessionId,
         source_ids: JSON.stringify(toCompress.map((e) => e.id)),
         metadata: JSON.stringify({
             type: "auto_compressed",
             originalCount: toCompress.length,
             originalTokens: toCompress.reduce((s, e) => s + e.tokens, 0),
+            sessionId,
         }),
     });
 
@@ -373,6 +491,7 @@ async function checkTier0Overflow(): Promise<void> {
     try {
         await addToVectorStore(compressed, summaryId, "summary", 0.9, {
             autoCompressed: true,
+            sessionId,
         });
     } catch {
         // non-fatal
@@ -385,19 +504,24 @@ async function checkTier0Overflow(): Promise<void> {
  */
 export async function compressMemory(scope: CompressScope): Promise<string> {
     const config = getConfig();
+    const sessionId = getCurrentSessionIdOrNull();
 
     switch (scope) {
         case "working": {
-            // Compress all of Tier 0 into a Tier 1 summary
-            if (_workingMemory.length === 0) {
+            // Compress all of current session Tier 0 into a Tier 1 summary
+            const sessionEntries = sessionId
+                ? _workingMemory.filter((e) => e.sessionId === sessionId)
+                : _workingMemory;
+
+            if (sessionEntries.length === 0) {
                 return "Working memory is empty, nothing to compress.";
             }
 
-            const content = _workingMemory
+            const content = sessionEntries
                 .map((e) => e.content)
                 .join("\n");
-            const originalTokens = getWorkingMemoryTokens();
-            const originalCount = _workingMemory.length;
+            const originalTokens = sessionEntries.reduce((s, e) => s + e.tokens, 0);
+            const originalCount = sessionEntries.length;
 
             const { text: compressed } = truncateToTokenBudget(
                 content,
@@ -412,24 +536,28 @@ export async function compressMemory(scope: CompressScope): Promise<string> {
                 tier: 1,
                 content: compressed,
                 token_count: compressedTokens,
-                session_id: null,
-                source_ids: JSON.stringify(_workingMemory.map((e) => e.id)),
+                session_id: sessionId,
+                source_ids: JSON.stringify(sessionEntries.map((e) => e.id)),
                 metadata: JSON.stringify({
                     type: "manual_compressed",
                     scope: "working",
                     originalCount,
                     originalTokens,
+                    sessionId,
                 }),
             });
 
             try {
-                await addToVectorStore(compressed, summaryId, "summary", 0.9);
+                await addToVectorStore(compressed, summaryId, "summary", 0.9, { sessionId });
             } catch {
                 // non-fatal
             }
 
-            // Clear working memory
+            // Clear current session working memory
+            const compressIds = new Set(sessionEntries.map((e) => e.id));
+            const remaining = _workingMemory.filter((e) => !compressIds.has(e.id));
             _workingMemory.length = 0;
+            _workingMemory.push(...remaining);
 
             return `Compressed ${originalCount} working memory entries (${originalTokens} tokens) into Tier 1 summary (${compressedTokens} tokens). Compression ratio: ${(originalTokens / Math.max(compressedTokens, 1)).toFixed(1)}x`;
         }
@@ -459,12 +587,13 @@ export async function compressMemory(scope: CompressScope): Promise<string> {
                 tier: 1,
                 content: compressed,
                 token_count: compressedTokens,
-                session_id: null,
+                session_id: sessionId,
                 source_ids: JSON.stringify(tier1.map((s) => s.id)),
                 metadata: JSON.stringify({
                     type: "session_consolidated",
                     originalCount: tier1.length,
                     originalTokens,
+                    sessionId,
                 }),
             });
 
@@ -475,7 +604,7 @@ export async function compressMemory(scope: CompressScope): Promise<string> {
             }
 
             try {
-                await addToVectorStore(compressed, summaryId, "summary", 0.85);
+                await addToVectorStore(compressed, summaryId, "summary", 0.85, { sessionId });
             } catch {
                 // non-fatal
             }
@@ -508,12 +637,13 @@ export async function compressMemory(scope: CompressScope): Promise<string> {
                 tier: 2,
                 content: compressed,
                 token_count: compressedTokens,
-                session_id: null,
+                session_id: sessionId,
                 source_ids: JSON.stringify(tier1.map((s) => s.id)),
                 metadata: JSON.stringify({
                     type: "epoch_summary",
                     originalCount: tier1.length,
                     originalTokens,
+                    sessionId,
                 }),
             });
 
@@ -524,7 +654,7 @@ export async function compressMemory(scope: CompressScope): Promise<string> {
             }
 
             try {
-                await addToVectorStore(compressed, epochId, "epoch", 0.8);
+                await addToVectorStore(compressed, epochId, "epoch", 0.8, { sessionId });
             } catch {
                 // non-fatal
             }
@@ -613,7 +743,11 @@ export function getMemoryStatus(): MemoryStatus {
         summariesByTier[tier] = getSummariesByTier(tier);
     }
 
-    const tier0Tokens = getWorkingMemoryTokens();
+    const sessionId = getCurrentSessionIdOrNull();
+    const sessionEntries = sessionId
+        ? _workingMemory.filter((e) => e.sessionId === sessionId)
+        : _workingMemory;
+    const tier0Tokens = sessionEntries.reduce((s, e) => s + e.tokens, 0);
     const tier1Tokens = summariesByTier[1]?.reduce((s, r) => s + r.token_count, 0) || 0;
     const tier2Tokens = summariesByTier[2]?.reduce((s, r) => s + r.token_count, 0) || 0;
     const tier3Tokens = summariesByTier[3]?.reduce((s, r) => s + r.token_count, 0) || 0;
@@ -622,7 +756,7 @@ export function getMemoryStatus(): MemoryStatus {
 
     return {
         tiers: {
-            tier0: { count: _workingMemory.length, tokenEstimate: tier0Tokens },
+            tier0: { count: sessionEntries.length, tokenEstimate: tier0Tokens },
             tier1: { count: tierCounts[1] || 0, tokenEstimate: tier1Tokens },
             tier2: { count: tierCounts[2] || 0, tokenEstimate: tier2Tokens },
             tier3: { count: tierCounts[3] || 0, tokenEstimate: tier3Tokens },
@@ -630,6 +764,7 @@ export function getMemoryStatus(): MemoryStatus {
         knowledgeGraph: graphStats,
         vectorStore: { count: getVectorStoreCount() },
         totalTokensStored: tier0Tokens + tier1Tokens + tier2Tokens + tier3Tokens,
+        currentSessionId: sessionId,
     };
 }
 
@@ -646,8 +781,12 @@ export function getCoreMemory(): string {
  * Get current session working memory content.
  */
 export function getCurrentSessionMemory(): string {
-    if (_workingMemory.length === 0) return "No working memory entries.";
-    return _workingMemory
+    const sessionId = getCurrentSessionIdOrNull();
+    const entries = sessionId
+        ? _workingMemory.filter((e) => e.sessionId === sessionId)
+        : _workingMemory;
+    if (entries.length === 0) return "No working memory entries for this session.";
+    return entries
         .map((e) => `[${e.timestamp}] ${e.content}`)
         .join("\n");
 }

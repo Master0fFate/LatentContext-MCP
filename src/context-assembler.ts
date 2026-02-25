@@ -1,10 +1,17 @@
 import { getConfig } from "./config.js";
-import { getSummariesByTier, logAccess, getAccessFrequency } from "./database.js";
+import {
+    getSummariesByTier,
+    getSummariesByTierAndSession,
+    getSummariesByTierExcludingSession,
+    logAccess,
+    getAccessFrequency,
+} from "./database.js";
 import { queryEntity, serializeFacts, getAllFacts } from "./knowledge-graph.js";
 import { searchVectors, type VectorSearchResult, type VectorSearchFilter } from "./vector-store.js";
 import { countTokens, truncateToTokenBudget } from "./token-counter.js";
 import { cosineSimilarity } from "./embeddings.js";
 import { getCoreMemory, getWorkingMemory } from "./memory-manager.js";
+import { getCurrentSessionIdOrNull, getSessionStartTime } from "./session.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -15,7 +22,7 @@ interface ContextCandidate {
     content: string;
     tokens: number;
     score: number;
-    source: string; // 'core' | 'working' | 'vector' | 'graph' | 'tier1' | 'tier2'
+    source: string; // 'core' | 'working' | 'vector' | 'graph' | 'current_session' | 'past_sessions' | 'long_term'
     similarity: number;
     recency: number;
     priority: number;
@@ -31,6 +38,7 @@ export interface AssembledContext {
     sourceCounts: Record<string, number>;
     candidatesConsidered: number;
     candidatesSelected: number;
+    sessionId: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -56,12 +64,14 @@ function sourcePriority(source: string): number {
         case "core":
             return 1.0;
         case "working":
+            return 0.95;
+        case "current_session":
             return 0.9;
         case "graph":
             return 0.8;
-        case "tier2":
-            return 0.6;
-        case "tier1":
+        case "long_term":
+            return 0.65;
+        case "past_sessions":
             return 0.5;
         case "vector":
             return 0.4;
@@ -157,13 +167,15 @@ function extractEntityMentions(query: string): string[] {
  *
  * Algorithm:
  * 1. Always include Tier 3 core memory
- * 2. Embed query → vector search (top 20 candidates)
- * 3. Extract entity mentions → knowledge graph queries
- * 4. Gather Tier 1 and Tier 2 summaries
- * 5. Score all candidates by composite relevance
- * 6. Deduplicate
- * 7. Greedily fill budget by score
- * 8. Format output with section headers
+ * 2. Include current session working memory (Tier 0)
+ * 3. Embed query → vector search (top 20 candidates)
+ * 4. Extract entity mentions → knowledge graph queries
+ * 5. Gather current session Tier 1 summaries
+ * 6. Gather past-session Tier 1 and Tier 2 summaries
+ * 7. Score all candidates by composite relevance
+ * 8. Deduplicate
+ * 9. Greedily fill budget by score
+ * 10. Format output with session-aware section headers
  */
 export async function assembleContext(
     query: string,
@@ -174,6 +186,7 @@ export async function assembleContext(
     const budget = tokenBudget || config.tokenBudgets.defaultRetrieveBudget;
     let remainingBudget = budget;
 
+    const sessionId = getCurrentSessionIdOrNull();
     const candidates: ContextCandidate[] = [];
     const sourceCounts: Record<string, number> = {};
 
@@ -187,12 +200,30 @@ export async function assembleContext(
             coreMemory,
             Math.min(coreTokens, config.tokenBudgets.tier3Core)
         );
-        coreSection = `[Core Memory]\n${coreTruncated}`;
+        coreSection = `[Core Memory] ${coreTruncated}`;
         remainingBudget -= countTokens(coreSection);
         sourceCounts["core"] = 1;
     }
 
-    // ── 2. Vector search ──
+    // ── 2. Current session working memory (Tier 0) ──
+    const workingMem = getWorkingMemory();
+    if (workingMem && workingMem.length > 0) {
+        const wmTokens = countTokens(workingMem);
+        candidates.push({
+            id: "working-memory",
+            content: workingMem,
+            tokens: wmTokens,
+            score: 0,
+            source: "working",
+            similarity: 0.6,
+            recency: 1.0,
+            priority: sourcePriority("working"),
+            frequency: 1.0,
+            createdAt: new Date().toISOString(),
+        });
+    }
+
+    // ── 3. Vector search ──
     try {
         const vectorResults = await searchVectors(query, 20, filters);
         for (const vr of vectorResults) {
@@ -203,12 +234,12 @@ export async function assembleContext(
                 id: vr.id,
                 content: vr.contentPreview,
                 tokens: countTokens(vr.contentPreview),
-                score: 0, // Computed later
+                score: 0,
                 source: "vector",
                 similarity: vr.similarity,
                 recency: recencyScore(vr.createdAt),
                 priority: sourcePriority(vr.sourceType === "core" ? "core" : "vector"),
-                frequency: Math.min(freq / 10, 1.0), // Normalize frequency 0-1
+                frequency: Math.min(freq / 10, 1.0),
                 createdAt: vr.createdAt,
             });
         }
@@ -216,12 +247,11 @@ export async function assembleContext(
         // Vector search failure is non-fatal (e.g., embedding model not loaded)
     }
 
-    // ── 3. Knowledge graph queries ──
+    // ── 4. Knowledge graph queries ──
     const entityMentions = extractEntityMentions(query);
     const graphContents: string[] = [];
 
     for (const entity of entityMentions.slice(0, 5)) {
-        // Limit to 5 entities
         const result = queryEntity(entity, 2);
         if (result) {
             graphContents.push(result.serialized);
@@ -239,34 +269,55 @@ export async function assembleContext(
             tokens: graphTokens,
             score: 0,
             source: "graph",
-            similarity: 0.7, // Default high relevance for direct graph matches
-            recency: 1.0, // Graph facts are always "current"
+            similarity: 0.7,
+            recency: 1.0,
             priority: sourcePriority("graph"),
             frequency: 0.5,
             createdAt: new Date().toISOString(),
         });
     }
 
-    // ── 4. Gather Tier 1 and Tier 2 summaries ──
-    const tier1Summaries = getSummariesByTier(1);
-    const tier2Summaries = getSummariesByTier(2);
+    // ── 5. Current session Tier 1 summaries ──
+    if (sessionId) {
+        const currentSessionSummaries = getSummariesByTierAndSession(1, sessionId);
+        for (const summary of currentSessionSummaries.slice(0, 5)) {
+            const freq = getAccessFrequency(summary.id);
+            candidates.push({
+                id: summary.id,
+                content: summary.content,
+                tokens: summary.token_count,
+                score: 0,
+                source: "current_session",
+                similarity: 0.6,
+                recency: recencyScore(summary.created_at),
+                priority: sourcePriority("current_session"),
+                frequency: Math.min(freq / 10, 1.0),
+                createdAt: summary.created_at,
+            });
+        }
+    }
 
-    for (const summary of tier1Summaries.slice(0, 10)) {
+    // ── 6. Past session Tier 1 and Tier 2 summaries ──
+    const pastTier1 = sessionId
+        ? getSummariesByTierExcludingSession(1, sessionId)
+        : getSummariesByTier(1);
+    for (const summary of pastTier1.slice(0, 10)) {
         const freq = getAccessFrequency(summary.id);
         candidates.push({
             id: summary.id,
             content: summary.content,
             tokens: summary.token_count,
             score: 0,
-            source: "tier1",
-            similarity: 0.5, // Default — improved if vector search already found it
+            source: "past_sessions",
+            similarity: 0.5,
             recency: recencyScore(summary.created_at),
-            priority: sourcePriority("tier1"),
+            priority: sourcePriority("past_sessions"),
             frequency: Math.min(freq / 10, 1.0),
             createdAt: summary.created_at,
         });
     }
 
+    const tier2Summaries = getSummariesByTier(2);
     for (const summary of tier2Summaries.slice(0, 5)) {
         const freq = getAccessFrequency(summary.id);
         candidates.push({
@@ -274,34 +325,16 @@ export async function assembleContext(
             content: summary.content,
             tokens: summary.token_count,
             score: 0,
-            source: "tier2",
-            similarity: 0.4, // Default
+            source: "long_term",
+            similarity: 0.4,
             recency: recencyScore(summary.created_at),
-            priority: sourcePriority("tier2"),
+            priority: sourcePriority("long_term"),
             frequency: Math.min(freq / 10, 1.0),
             createdAt: summary.created_at,
         });
     }
 
-    // ── 5. Include working memory (Tier 0) ──
-    const workingMem = getWorkingMemory();
-    if (workingMem && workingMem.length > 0) {
-        const wmTokens = countTokens(workingMem);
-        candidates.push({
-            id: "working-memory",
-            content: workingMem,
-            tokens: wmTokens,
-            score: 0,
-            source: "working",
-            similarity: 0.6, // Moderate relevance
-            recency: 1.0, // Always current
-            priority: sourcePriority("working"),
-            frequency: 1.0,
-            createdAt: new Date().toISOString(),
-        });
-    }
-
-    // ── 6. Compute composite scores ──
+    // ── 7. Compute composite scores ──
     const weights = config.ranking;
     for (const candidate of candidates) {
         candidate.score =
@@ -311,10 +344,10 @@ export async function assembleContext(
             weights.frequencyWeight * candidate.frequency;
     }
 
-    // ── 7. Deduplicate ──
+    // ── 8. Deduplicate ──
     const deduped = deduplicate(candidates, weights.dedupSimilarityThreshold);
 
-    // ── 8. Sort by score and greedily fill budget ──
+    // ── 9. Sort by score and greedily fill budget ──
     deduped.sort((a, b) => b.score - a.score);
 
     const selected: ContextCandidate[] = [];
@@ -329,9 +362,10 @@ export async function assembleContext(
         }
     }
 
-    // ── 9. Format output ──
+    // ── 10. Format output with session-aware sections ──
     const sections: string[] = [];
 
+    // Core Memory always first
     if (coreSection) {
         sections.push(coreSection);
     }
@@ -343,13 +377,15 @@ export async function assembleContext(
         bySource[s.source].push(s);
     }
 
-    const sourceOrder = ["working", "graph", "tier2", "tier1", "vector"];
+    // Define section order and labels — session-scoped then cross-session
+    const sourceOrder = ["working", "current_session", "graph", "long_term", "past_sessions", "vector"];
     const sourceLabels: Record<string, string> = {
-        working: "Working Memory",
-        graph: "Knowledge Graph",
-        tier2: "Long-term Context",
-        tier1: "Session History",
-        vector: "Related Memories",
+        working: "Current Session",
+        current_session: "Current Session Notes",
+        graph: "Known Facts",
+        long_term: "Long-term Knowledge",
+        past_sessions: "Past Sessions",
+        vector: "Semantic Matches",
     };
 
     for (const source of sourceOrder) {
@@ -357,14 +393,26 @@ export async function assembleContext(
         if (items && items.length > 0) {
             const label = sourceLabels[source] || source;
             const content = items.map((item) => item.content).join("\n");
-            sections.push(`[${label}]\n${content}`);
+            sections.push(`[${label}] ${content}`);
         }
     }
 
-    const finalText =
-        sections.length > 0
-            ? sections.join("\n\n")
-            : "No relevant memories found for this query.";
+    // Build final text
+    let finalText: string;
+
+    if (sections.length > 0) {
+        finalText = sections.join("\n\n");
+
+        // Add metadata footer
+        const sourceList = Object.entries(sourceCounts)
+            .map(([source, count]) => `${source}:${count}`)
+            .join(", ");
+        const budgetUsed = budget - remainingBudget;
+        const sessionLabel = sessionId ? sessionId.substring(0, 8) : "none";
+        finalText += `\n\n--- Session: ${sessionLabel} | Sources: ${sourceList} | Tokens: ${budgetUsed}/${budget} ---`;
+    } else {
+        finalText = "No relevant memories found. This appears to be a new conversation — use memory_store to save important information as you go.";
+    }
 
     const totalTokens = countTokens(finalText);
 
@@ -376,5 +424,6 @@ export async function assembleContext(
         sourceCounts,
         candidatesConsidered: candidates.length,
         candidatesSelected: selected.length + (coreSection ? 1 : 0),
+        sessionId,
     };
 }

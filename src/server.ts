@@ -14,6 +14,7 @@ import {
     getMemoryStatus,
     getCoreMemory,
     getCurrentSessionMemory,
+    archiveWorkingMemory,
     type MemoryType,
     type CompressScope,
     type ForgetAction,
@@ -25,6 +26,11 @@ import {
     serializeFacts,
     getGraphSchema,
 } from "./knowledge-graph.js";
+import {
+    startSession,
+    getSessionInfo,
+    getCurrentSessionIdOrNull,
+} from "./session.js";
 
 // ---------------------------------------------------------------------------
 // Create the MCP Server
@@ -34,7 +40,7 @@ export function createServer(): Server {
     const server = new Server(
         {
             name: "latentcontext-mcp",
-            version: "1.0.0",
+            version: "1.1.0",
         },
         {
             capabilities: {
@@ -52,31 +58,66 @@ export function createServer(): Server {
     server.setRequestHandler(ListToolsRequestSchema, async () => ({
         tools: [
             {
+                name: "session_start",
+                description:
+                    `Start a new memory session. Call this ONCE at the very beginning of each new conversation.
+
+WHEN TO USE:
+- At the START of every new conversation, before doing anything else.
+- When the user explicitly says "new topic" or "let's start fresh".
+
+WHAT IT DOES:
+- Archives the previous session's working memory into long-term storage.
+- Creates a fresh, empty working memory for the new conversation.
+- Returns the new session ID and a summary of what was archived.
+
+WARNING: If you skip this, memories from the previous conversation will leak into the current one. Always call this first.`,
+                inputSchema: {
+                    type: "object" as const,
+                    properties: {},
+                },
+            },
+            {
                 name: "memory_store",
                 description:
-                    "Store information in long-term memory. Automatically categorizes, indexes in the knowledge graph, and creates vector embeddings for semantic retrieval.",
+                    `Store information in long-term memory. Call this PROACTIVELY whenever you learn something new — do NOT wait to be asked.
+
+WHEN TO USE:
+- After the user tells you their name, preferences, project details, or any personal information.
+- After completing a task (store what was done and the outcome).
+- When you discover important facts about the user's codebase, setup, or workflow.
+- Whenever information might be useful in future conversations.
+
+MEMORY TYPES (choose carefully):
+- 'core': CRITICAL permanent facts (user's name, key project info, important preferences). Never evicted. Use sparingly — only for the most important things.
+- 'fact': Concrete knowledge with entities (e.g., "User's website uses Vanta.js for backgrounds"). Automatically indexed in the knowledge graph.
+- 'preference': User likes/dislikes/habits (e.g., "User prefers dark mode with blue accents"). Stored with high priority.
+- 'event': Timestamped occurrences — what just happened in this session (e.g., "Fixed CORS issue with audio playback"). Goes to working memory.
+- 'summary': Compressed notes about a session or topic. Used for manual summarization.
+
+ENTITIES: Always provide relevant entity names in the 'entities' array for 'fact' type. The first entity is treated as the subject. Example: entities: ["User", "dark mode"] for "User prefers dark mode".`,
                 inputSchema: {
                     type: "object" as const,
                     properties: {
                         content: {
                             type: "string",
-                            description: "The information to store.",
+                            description: "The information to store. Be concise but complete.",
                         },
                         memory_type: {
                             type: "string",
                             enum: ["fact", "preference", "event", "summary", "core"],
                             description:
-                                "Category: 'fact' for knowledge graph triples, 'preference' for user likes/dislikes, 'event' for timestamped occurrences, 'summary' for session summaries, 'core' for never-evicted critical info.",
+                                "Category: 'core' for critical permanent info, 'fact' for knowledge, 'preference' for user likes/dislikes, 'event' for what just happened, 'summary' for compressed notes.",
                         },
                         confidence: {
                             type: "number",
-                            description: "Confidence 0.0-1.0. Lower confidence = evicted first. Default 1.0.",
+                            description: "Confidence 0.0-1.0. Lower confidence = evicted first. Default 1.0. Use lower values for uncertain or temporary information.",
                         },
                         entities: {
                             type: "array",
                             items: { type: "string" },
                             description:
-                                "Key entities this memory relates to, for knowledge graph indexing. First entity is treated as the subject.",
+                                "Key entities this memory relates to. REQUIRED for 'fact' type — first entity is the subject. Example: ['User', 'JavaScript'] for 'User knows JavaScript'.",
                         },
                     },
                     required: ["content", "memory_type"],
@@ -85,17 +126,34 @@ export function createServer(): Server {
             {
                 name: "memory_retrieve",
                 description:
-                    "Retrieve relevant context for a query. Returns ranked, deduplicated context from all memory subsystems (knowledge graph, vector index, tiered summaries) within a token budget.",
+                    `Retrieve relevant memories for a query. Returns ranked, deduplicated context organized by session.
+
+WHEN TO USE:
+- At the START of every conversation (after session_start) to load relevant context.
+- BEFORE answering questions that might benefit from prior knowledge about the user or their projects.
+- When the user references something from a previous conversation.
+- When you need to recall what was discussed earlier.
+
+WHAT YOU GET BACK:
+- [Core Memory]: Permanent facts that are always included.
+- [Current Session]: Working memory from this conversation.
+- [Current Session Notes]: Compressed notes from this session.
+- [Known Facts]: Structured knowledge graph relationships.
+- [Past Sessions]: Summaries from previous conversations.
+- [Long-term Knowledge]: High-level themes and patterns.
+- [Semantic Matches]: Contextually similar memories from any time.
+
+The output includes a metadata footer showing session ID, source breakdown, and token usage.`,
                 inputSchema: {
                     type: "object" as const,
                     properties: {
                         query: {
                             type: "string",
-                            description: "The query to retrieve context for.",
+                            description: "What to search for. Use natural language — semantic search handles the rest.",
                         },
                         token_budget: {
                             type: "integer",
-                            description: "Max tokens to return. Default 3000.",
+                            description: "Max tokens to return. Default 3000. Increase for broad context, decrease for focused queries.",
                         },
                         filters: {
                             type: "object",
@@ -103,7 +161,7 @@ export function createServer(): Server {
                                 memory_types: {
                                     type: "array",
                                     items: { type: "string" },
-                                    description: "Filter by source types.",
+                                    description: "Filter by source types (e.g., ['fact', 'preference']).",
                                 },
                                 after: {
                                     type: "string",
@@ -115,7 +173,7 @@ export function createServer(): Server {
                                 },
                                 min_confidence: {
                                     type: "number",
-                                    description: "Minimum confidence score to include.",
+                                    description: "Minimum confidence score to include (0.0-1.0).",
                                 },
                             },
                         },
@@ -126,21 +184,31 @@ export function createServer(): Server {
             {
                 name: "graph_query",
                 description:
-                    "Query the knowledge graph for facts about entities or relationships. Returns structured triples.",
+                    `Query the knowledge graph for structured facts about specific entities and their relationships.
+
+WHEN TO USE:
+- When you need to look up specific facts about the user, their projects, or any named entity.
+- When the user asks "what do you know about X?".
+- To check if a fact already exists before storing a new one.
+
+WHAT YOU GET BACK: Structured entity information with outgoing and incoming relationships.
+Example output: "Entity: User (person) → prefers → dark mode → works_at → ExampleCorp"
+
+DEPTH: Set depth > 1 to discover indirect relationships (e.g., depth 2 finds friends-of-friends).`,
                 inputSchema: {
                     type: "object" as const,
                     properties: {
                         entity: {
                             type: "string",
-                            description: "Entity to look up.",
+                            description: "Entity to look up (case-insensitive). Example: 'User', 'JavaScript', 'fate.rf.gd'.",
                         },
                         relation: {
                             type: "string",
-                            description: "Optional predicate filter (e.g., 'located_in', 'works_at').",
+                            description: "Optional predicate filter (e.g., 'prefers', 'located_in', 'works_at', 'uses'). Only returns matching relationships.",
                         },
                         depth: {
                             type: "integer",
-                            description: "Graph traversal hops. Default 1.",
+                            description: "Graph traversal hops. Default 1. Set to 2 to include neighbors' relationships.",
                         },
                     },
                     required: ["entity"],
@@ -149,14 +217,24 @@ export function createServer(): Server {
             {
                 name: "memory_compress",
                 description:
-                    "Compress memory at a given scope. 'working' compresses Tier 0 → Tier 1. 'session' consolidates Tier 1 entries. 'epoch' promotes Tier 1 → Tier 2.",
+                    `Compress memory at a given scope to reduce token usage and consolidate information.
+
+WHEN TO USE:
+- 'working': When working memory is getting large during a long conversation. Compresses current session buffer into a summary.
+- 'session': When there are many session summaries. Merges multiple session-level summaries into fewer entries.
+- 'epoch': After many sessions have accumulated. Promotes session summaries into high-level long-term knowledge. Requires at least 10 session summaries.
+
+EFFECTS:
+- All compression is lossy — details are condensed but key information is preserved.
+- Compressed data is re-embedded for semantic search.
+- Original entries are removed after compression.`,
                 inputSchema: {
                     type: "object" as const,
                     properties: {
                         scope: {
                             type: "string",
                             enum: ["working", "session", "epoch"],
-                            description: "Compression scope.",
+                            description: "Compression scope: 'working' (current session), 'session' (merge sessions), 'epoch' (long-term consolidation).",
                         },
                     },
                     required: ["scope"],
@@ -165,22 +243,34 @@ export function createServer(): Server {
             {
                 name: "memory_forget",
                 description:
-                    "Mark a memory as outdated or incorrect. 'deprecate' lowers confidence, 'correct' replaces content, 'delete' removes entirely.",
+                    `Mark a memory as outdated, incorrect, or to be deleted.
+
+WHEN TO USE:
+- When the user corrects previously stored information.
+- When stored facts become outdated (e.g., user changed jobs, moved cities).
+- When duplicate or incorrect memories need cleanup.
+
+ACTIONS:
+- 'deprecate': Lowers confidence score so the memory is deprioritized but not removed. Use when unsure.
+- 'correct': Replaces the memory content with new, correct information. Requires the 'correction' parameter.
+- 'delete': Permanently removes the memory. Use for clearly wrong or duplicate entries.
+
+You need the memory_id which is returned when you store a memory, or visible in memory_status output.`,
                 inputSchema: {
                     type: "object" as const,
                     properties: {
                         memory_id: {
                             type: "string",
-                            description: "ID of the memory to modify.",
+                            description: "ID of the memory to modify (UUID format, returned by memory_store).",
                         },
                         action: {
                             type: "string",
                             enum: ["deprecate", "correct", "delete"],
-                            description: "Action to take.",
+                            description: "Action to take: 'deprecate' (lower priority), 'correct' (replace content), 'delete' (remove permanently).",
                         },
                         correction: {
                             type: "string",
-                            description: "New content if action is 'correct'.",
+                            description: "New content to replace the memory with. Required when action is 'correct'.",
                         },
                     },
                     required: ["memory_id", "action"],
@@ -189,7 +279,15 @@ export function createServer(): Server {
             {
                 name: "memory_status",
                 description:
-                    "Get storage stats for all memory subsystems: tier counts, token usage, graph size, vector count.",
+                    `Get storage statistics for all memory subsystems.
+
+WHEN TO USE:
+- When debugging memory-related issues.
+- When the user asks "what do you remember?" or "how much is stored?".
+- To check if session_start was called (shows current session ID).
+- To monitor token budgets and plan compression.
+
+SHOWS: Tier counts, token estimates, knowledge graph size, vector store count, and current session ID.`,
                 inputSchema: {
                     type: "object" as const,
                     properties: {},
@@ -204,6 +302,28 @@ export function createServer(): Server {
 
         try {
             switch (name) {
+                case "session_start": {
+                    const result = await startSession(async (oldSessionId) => {
+                        return archiveWorkingMemory(oldSessionId);
+                    });
+
+                    const lines = [
+                        `New session started: ${result.sessionId}`,
+                        `Started at: ${result.startedAt}`,
+                    ];
+
+                    if (result.previousSessionArchived && result.previousSessionId) {
+                        lines.push(`Previous session archived: ${result.previousSessionId}`);
+                        lines.push(`Archive: ${result.archiveSummary}`);
+                    } else if (result.previousSessionId) {
+                        lines.push(`Previous session ended: ${result.previousSessionId} (no data to archive)`);
+                    } else {
+                        lines.push("No previous session to archive (first session).");
+                    }
+
+                    return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+                }
+
                 case "memory_store": {
                     const content = args?.content as string;
                     const memoryType = (args?.memory_type || "event") as MemoryType;
@@ -222,6 +342,7 @@ export function createServer(): Server {
                     const response = [
                         `Stored as ${result.memoryType} (Tier ${result.tier})`,
                         `ID: ${result.memoryId}`,
+                        result.sessionId ? `Session: ${result.sessionId.substring(0, 8)}` : null,
                         result.factsStored > 0 ? `Facts stored: ${result.factsStored}` : null,
                         result.entitiesCreated.length > 0
                             ? `Entities: ${result.entitiesCreated.join(", ")}`
@@ -329,15 +450,18 @@ export function createServer(): Server {
 
                 case "memory_status": {
                     const status = getMemoryStatus();
+                    const sessionInfo = getSessionInfo();
                     const lines = [
                         "=== Memory Status ===",
-                        `Tier 0 (Working): ${status.tiers.tier0.count} entries, ~${status.tiers.tier0.tokenEstimate} tokens`,
-                        `Tier 1 (Session): ${status.tiers.tier1.count} entries, ~${status.tiers.tier1.tokenEstimate} tokens`,
-                        `Tier 2 (Epoch):   ${status.tiers.tier2.count} entries, ~${status.tiers.tier2.tokenEstimate} tokens`,
-                        `Tier 3 (Core):    ${status.tiers.tier3.count} entries, ~${status.tiers.tier3.tokenEstimate} tokens`,
-                        `Knowledge Graph:  ${status.knowledgeGraph.entities} entities, ${status.knowledgeGraph.relations} relations`,
-                        `Vector Store:     ${status.vectorStore.count} vectors`,
-                        `Total Tokens:     ~${status.totalTokensStored}`,
+                        `Session: ${sessionInfo ? `${sessionInfo.sessionId.substring(0, 8)}... (started ${sessionInfo.startedAt})` : "No active session — call session_start first!"}`,
+                        "",
+                        `Tier 0 (Working):  ${status.tiers.tier0.count} entries, ~${status.tiers.tier0.tokenEstimate} tokens`,
+                        `Tier 1 (Session):  ${status.tiers.tier1.count} entries, ~${status.tiers.tier1.tokenEstimate} tokens`,
+                        `Tier 2 (Epoch):    ${status.tiers.tier2.count} entries, ~${status.tiers.tier2.tokenEstimate} tokens`,
+                        `Tier 3 (Core):     ${status.tiers.tier3.count} entries, ~${status.tiers.tier3.tokenEstimate} tokens`,
+                        `Knowledge Graph:   ${status.knowledgeGraph.entities} entities, ${status.knowledgeGraph.relations} relations`,
+                        `Vector Store:      ${status.vectorStore.count} vectors`,
+                        `Total Tokens:      ~${status.totalTokensStored}`,
                     ];
                     return { content: [{ type: "text" as const, text: lines.join("\n") }] };
                 }
@@ -372,7 +496,7 @@ export function createServer(): Server {
             {
                 uri: "memory://session/current",
                 name: "Current Session Memory",
-                description: "Tier 0 working memory for the current session.",
+                description: "Tier 0 working memory for the current session only.",
                 mimeType: "text/plain",
             },
             {
