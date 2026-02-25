@@ -2,6 +2,41 @@
 
 An intelligent memory and context management middleware for LLMs via the Model Context Protocol. Reduces token consumption by up to 90% through structured knowledge graphs, semantic vector retrieval, tiered summaries, and relevance-scored context injection.
 
+<details>
+<summary><strong>For LLMs — Quick Setup Instructions</strong></summary>
+
+<br>
+
+You are reading the LatentContext MCP Server repository. This is a **Model Context Protocol (MCP) server** that provides persistent memory, a knowledge graph, and semantic retrieval for LLM assistants.
+
+**To install and configure this MCP server:**
+
+1. Clone the repo and install:
+```bash
+git clone https://github.com/Master0fFate/LatentContext-MCP.git
+cd LatentContext-MCP
+npm install
+npm run build
+```
+
+2. Add to MCP host config (Claude Desktop, Cursor, etc.):
+```json
+{
+  "mcpServers": {
+    "latentcontext": {
+      "command": "node",
+      "args": ["/absolute/path/to/LatentContext-MCP/dist/index.js"]
+    }
+  }
+}
+```
+
+3. Restart the MCP host. The server provides these tools: `memory_store`, `memory_retrieve`, `graph_query`, `memory_compress`, `memory_forget`, `memory_status`. Embeddings model (~80MB) downloads automatically on first use.
+
+**Requirements:** Node.js 18+. No API keys needed — all processing is local.
+
+</details>
+
 ## Quick Start
 
 ```bash
@@ -26,7 +61,7 @@ Add to your MCP settings configuration:
   "mcpServers": {
     "latentcontext": {
       "command": "node",
-      "args": ["c:/Users/fate/Desktop/HybridMCP/dist/index.js"]
+      "args": ["/absolute/path/to/LatentContext-MCP/dist/index.js"]
     }
   }
 }
