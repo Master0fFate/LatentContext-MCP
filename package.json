@@ -1,0 +1,38 @@
+{
+    "name": "latentcontext-mcp",
+    "version": "1.0.0",
+    "description": "LatentContext MCP Server — Intelligent memory and context management for LLMs",
+    "type": "module",
+    "main": "dist/index.js",
+    "bin": {
+        "latentcontext-mcp": "dist/index.js"
+    },
+    "scripts": {
+        "build": "tsc",
+        "start": "node dist/index.js",
+        "dev": "tsx src/index.ts"
+    },
+    "keywords": [
+        "mcp",
+        "llm",
+        "context",
+        "memory",
+        "knowledge-graph",
+        "vector-search"
+    ],
+    "license": "MIT",
+    "dependencies": {
+        "@huggingface/transformers": "^3.4.0",
+        "@modelcontextprotocol/sdk": "^1.12.0",
+        "js-tiktoken": "^1.0.19",
+        "sql.js": "^1.12.0",
+        "uuid": "^11.1.0",
+        "zod": "^3.24.0"
+    },
+    "devDependencies": {
+        "@types/node": "^22.13.0",
+        "@types/uuid": "^10.0.0",
+        "tsx": "^4.19.0",
+        "typescript": "^5.7.0"
+    }
+}

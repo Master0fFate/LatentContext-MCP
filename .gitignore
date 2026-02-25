@@ -1,0 +1,48 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Runtime data
+data/
+*.db
+
+# Archives
+*.7z
+*.zip
+*.tar.gz
+*.rar
+
+# Build output
+dist/
+
+# Runtime data
+data/
+*.db
+
+# Environment / config with secrets
+.env
+.env.*
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+npm-debug.log*
+
+# TypeScript incremental
+*.tsbuildinfo
+
+# Huggingface model cache (downloaded at runtime)
+.cache/
