@@ -103,3 +103,36 @@ Set `"provider": "none"` to disable embeddings (vector search will return empty 
 ## Data Storage
 
 All data is stored locally in `./data/memory.db` (SQLite via WASM). No data leaves your machine when using local embeddings.
+
+>>>
+<details>
+<summary>For LLMs</summary>
+
+**LLM Installation Prompt for LatentContext-MCP Server:**
+
+```
+To install and run this LatentContext-MCP server (Model Context Protocol for latent context handling):
+
+1. Clone: `git clone https://github.com/Master0fFate/LatentContext-MCP.git`
+2. Enter dir: `cd LatentContext-MCP`
+3. Install deps: `npm install` (or `pip install -r requirements.txt` if Python)
+4. Build: `npm run build` (if applicable)
+5. Run server: `npm start` (or `python server.py`)
+
+Configure your MCP host (e.g., Claude Desktop settings.json) with:
+```json
+{
+  "mcpServers": {
+    "latentcontext": {
+      "command": "npm",
+      "args": ["start"],
+      "cwd": "/path/to/LatentContext-MCP"
+    }
+  }
+}
+```
+
+Use: Invoke "use latentcontext-mcp" in prompts for repo context. No further analysis needed.
+```
+
+</details>
