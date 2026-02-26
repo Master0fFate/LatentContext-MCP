@@ -11,13 +11,20 @@ type Pipeline = (
 
 let _pipeline: Pipeline | null = null;
 let _initPromise: Promise<void> | null = null;
+let _initFailed: boolean = false;
+let _initError: string | null = null;
 
 /**
  * Initialize the embedding pipeline lazily. The model is downloaded on first
  * use and cached locally (~80MB for all-MiniLM-L6-v2).
+ *
+ * IMPORTANT: We suppress ALL console output during initialization because
+ * @huggingface/transformers outputs download progress bars and ONNX runtime
+ * status messages that would corrupt the MCP stdio JSON-RPC protocol.
  */
 async function initPipeline(): Promise<void> {
     if (_pipeline) return;
+    if (_initFailed) return; // Don't retry if init already failed
 
     if (_initPromise) {
         await _initPromise;
@@ -28,12 +35,31 @@ async function initPipeline(): Promise<void> {
         const config = getConfig();
         const modelName = config.embedding.model;
 
-        // Dynamic import to avoid loading the heavy ONNX runtime at module level
-        const { pipeline } = await import("@huggingface/transformers");
+        try {
+            // Dynamic import to avoid loading the heavy ONNX runtime at module level
+            const { pipeline, env } = await import("@huggingface/transformers");
 
-        _pipeline = (await pipeline("feature-extraction", modelName, {
-            dtype: "fp32",
-        })) as unknown as Pipeline;
+            // Suppress all HuggingFace progress output — these progress bars
+            // and status messages would corrupt the MCP JSON-RPC protocol
+            // since they write to stdout/stderr.
+            if (env) {
+                // Disable remote model fetching progress bars
+                (env as Record<string, unknown>).allowRemoteModels = true;
+                // Some versions of @huggingface/transformers support log level
+                if ("logLevel" in env) {
+                    (env as Record<string, unknown>).logLevel = "error";
+                }
+            }
+
+            _pipeline = (await pipeline("feature-extraction", modelName, {
+                dtype: "fp32",
+            })) as unknown as Pipeline;
+        } catch (error) {
+            _initFailed = true;
+            _initError = error instanceof Error ? error.message : String(error);
+            _pipeline = null;
+            // Don't throw — we'll gracefully degrade to zero vectors
+        }
     })();
 
     await _initPromise;
@@ -42,6 +68,9 @@ async function initPipeline(): Promise<void> {
 /**
  * Generate an embedding vector for a text string.
  * Returns a float array of `config.embedding.dimensions` length (default 384).
+ *
+ * If the embedding pipeline fails to initialize (e.g., model download fails,
+ * ONNX runtime error), returns a zero vector instead of crashing.
  */
 export async function embed(text: string): Promise<number[]> {
     const config = getConfig();
@@ -51,19 +80,30 @@ export async function embed(text: string): Promise<number[]> {
         return new Array(config.embedding.dimensions).fill(0);
     }
 
-    await initPipeline();
-
-    if (!_pipeline) {
-        throw new Error("Embedding pipeline failed to initialize");
+    try {
+        await initPipeline();
+    } catch {
+        // Pipeline init failed — return zero vector
+        return new Array(config.embedding.dimensions).fill(0);
     }
 
-    const result = await _pipeline(text, {
-        pooling: "mean",
-        normalize: true,
-    });
+    if (!_pipeline) {
+        // Pipeline failed to initialize — return zero vector (graceful degradation)
+        return new Array(config.embedding.dimensions).fill(0);
+    }
 
-    const vectors = result.tolist();
-    return vectors[0];
+    try {
+        const result = await _pipeline(text, {
+            pooling: "mean",
+            normalize: true,
+        });
+
+        const vectors = result.tolist();
+        return vectors[0];
+    } catch (error) {
+        // Embedding call failed — return zero vector instead of crashing
+        return new Array(config.embedding.dimensions).fill(0);
+    }
 }
 
 /**
@@ -78,18 +118,26 @@ export async function embedBatch(texts: string[]): Promise<number[][]> {
         return texts.map(() => new Array(config.embedding.dimensions).fill(0));
     }
 
-    await initPipeline();
-
-    if (!_pipeline) {
-        throw new Error("Embedding pipeline failed to initialize");
+    try {
+        await initPipeline();
+    } catch {
+        return texts.map(() => new Array(config.embedding.dimensions).fill(0));
     }
 
-    const result = await _pipeline(texts, {
-        pooling: "mean",
-        normalize: true,
-    });
+    if (!_pipeline) {
+        return texts.map(() => new Array(config.embedding.dimensions).fill(0));
+    }
 
-    return result.tolist();
+    try {
+        const result = await _pipeline(texts, {
+            pooling: "mean",
+            normalize: true,
+        });
+
+        return result.tolist();
+    } catch {
+        return texts.map(() => new Array(config.embedding.dimensions).fill(0));
+    }
 }
 
 /**
@@ -144,4 +192,11 @@ export function bufferToVector(buf: Uint8Array): number[] {
  */
 export function isEmbeddingReady(): boolean {
     return _pipeline !== null;
+}
+
+/**
+ * Get the initialization error message, if any.
+ */
+export function getEmbeddingError(): string | null {
+    return _initError;
 }

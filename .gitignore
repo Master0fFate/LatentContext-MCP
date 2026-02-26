@@ -46,3 +46,10 @@ npm-debug.log*
 
 # Huggingface model cache (downloaded at runtime)
 .cache/
+
+# User-specific launcher scripts
+launch-*.mjs
+start-hidden.cmd
+
+# Test scripts
+test-*.mjs

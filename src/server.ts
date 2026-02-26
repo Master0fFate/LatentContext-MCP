@@ -62,16 +62,18 @@ export function createServer(): Server {
                 description:
                     `Start a new memory session. Call this ONCE at the very beginning of each new conversation.
 
-WHEN TO USE:
-- At the START of every new conversation, before doing anything else.
-- When the user explicitly says "new topic" or "let's start fresh".
+MANDATORY WORKFLOW — follow these steps IN ORDER every single time:
+1. Call session_start (this tool) FIRST.
+2. IMMEDIATELY after, call memory_retrieve with a broad query about the user and their projects.
+3. READ the retrieved context carefully and use it to inform your responses.
+4. Throughout the conversation, call memory_store to save DETAILED notes about everything important.
 
 WHAT IT DOES:
 - Archives the previous session's working memory into long-term storage.
 - Creates a fresh, empty working memory for the new conversation.
 - Returns the new session ID and a summary of what was archived.
 
-WARNING: If you skip this, memories from the previous conversation will leak into the current one. Always call this first.`,
+WARNING: If you skip this, memories from the previous conversation will leak into the current one. Always call this first, then ALWAYS call memory_retrieve right after.`,
                 inputSchema: {
                     type: "object" as const,
                     properties: {},
@@ -82,18 +84,34 @@ WARNING: If you skip this, memories from the previous conversation will leak int
                 description:
                     `Store information in long-term memory. Call this PROACTIVELY whenever you learn something new — do NOT wait to be asked.
 
+CRITICAL — CONTENT QUALITY RULES:
+Your memory entries MUST be DETAILED, SELF-CONTAINED paragraphs that a future AI can read and FULLY understand WITHOUT needing to re-derive anything. Each entry should be 3-5 sentences minimum. Include WHO, WHAT, WHY, HOW, and WHERE relevant.
+
+BAD (useless — too short, forces re-thinking):
+  "Fixed audio issue"
+  "User likes dark mode"
+  "Website uses Vanta.js"
+
+GOOD (detailed — saves tokens by preventing re-derivation):
+  "Fixed a CORS audio playback issue on the user's website fate.rf.gd. The problem was that the audio element was trying to load files from a different origin. Solution: added crossorigin='anonymous' attribute to the <audio> element and configured the server to send Access-Control-Allow-Origin headers. The audio visualizer now works correctly with the Vanta.js background."
+  "User strongly prefers dark mode designs with deep blue (#0a0e27) and purple (#6c63ff) accent colors. They want glassmorphism effects, smooth animations, and premium-feeling interfaces. They dislike plain/basic designs and have explicitly requested 'wow factor' aesthetics in multiple conversations."
+  "The user's personal website at fate.rf.gd uses a multi-section single-page layout with: Vanta.js globe wireframe background animation, a music player with bass-reactive glow visualizer, glassmorphic card components, Google Fonts (Inter/Outfit), and is hosted on InfinityFree. The tech stack is vanilla HTML/CSS/JS with no framework."
+
+REMEMBER: A memory that takes 20 tokens to store but saves a future LLM from spending 500 tokens re-analyzing is EXTREMELY valuable. Write entries as if briefing a colleague who has never seen this project before.
+
 WHEN TO USE:
 - After the user tells you their name, preferences, project details, or any personal information.
-- After completing a task (store what was done and the outcome).
-- When you discover important facts about the user's codebase, setup, or workflow.
+- After completing a task — store WHAT was done, WHY, HOW it was solved, and the OUTCOME.
+- When you discover important facts about the user's codebase, tech stack, architecture, or workflow.
+- When you make design decisions — store the decision AND the reasoning.
 - Whenever information might be useful in future conversations.
 
 MEMORY TYPES (choose carefully):
-- 'core': CRITICAL permanent facts (user's name, key project info, important preferences). Never evicted. Use sparingly — only for the most important things.
-- 'fact': Concrete knowledge with entities (e.g., "User's website uses Vanta.js for backgrounds"). Automatically indexed in the knowledge graph.
-- 'preference': User likes/dislikes/habits (e.g., "User prefers dark mode with blue accents"). Stored with high priority.
-- 'event': Timestamped occurrences — what just happened in this session (e.g., "Fixed CORS issue with audio playback"). Goes to working memory.
-- 'summary': Compressed notes about a session or topic. Used for manual summarization.
+- 'core': CRITICAL permanent facts (user identity, key project info, important preferences). Never evicted. Use sparingly — only for the 5-10 most important things.
+- 'fact': Concrete knowledge with entities. Include full context, not just the fact. Automatically indexed in the knowledge graph.
+- 'preference': User likes/dislikes/habits. Describe the preference with specifics (colors, styles, patterns), not just the category.
+- 'event': What just happened in this session. Describe the task, approach, solution, and result in detail.
+- 'summary': Compressed notes about a session or topic. Should be a dense briefing paragraph, not bullet points.
 
 ENTITIES: Always provide relevant entity names in the 'entities' array for 'fact' type. The first entity is treated as the subject. Example: entities: ["User", "dark mode"] for "User prefers dark mode".`,
                 inputSchema: {
@@ -101,7 +119,7 @@ ENTITIES: Always provide relevant entity names in the 'entities' array for 'fact
                     properties: {
                         content: {
                             type: "string",
-                            description: "The information to store. Be concise but complete.",
+                            description: "DETAILED, self-contained paragraph (3-5+ sentences). Must include full context so a future AI can understand without re-deriving. Include specifics: names, paths, colors, versions, decisions, reasoning. NEVER write single sentences — that defeats the purpose of memory.",
                         },
                         memory_type: {
                             type: "string",
@@ -128,32 +146,42 @@ ENTITIES: Always provide relevant entity names in the 'entities' array for 'fact
                 description:
                     `Retrieve relevant memories for a query. Returns ranked, deduplicated context organized by session.
 
+MANDATORY — ALWAYS call this immediately after session_start. Also call before ANY task that could benefit from prior knowledge.
+
 WHEN TO USE:
-- At the START of every conversation (after session_start) to load relevant context.
+- IMMEDIATELY after session_start — use query "user preferences projects overview" to load broad context.
 - BEFORE answering questions that might benefit from prior knowledge about the user or their projects.
 - When the user references something from a previous conversation.
-- When you need to recall what was discussed earlier.
+- When you need to recall previous decisions, implementations, or preferences.
+- Before starting any coding task — retrieve context about the project's architecture, tech stack, and past decisions.
 
-WHAT YOU GET BACK:
-- [Core Memory]: Permanent facts that are always included.
-- [Current Session]: Working memory from this conversation.
+HOW TO USE THE RESULTS:
+- READ every section of the returned context carefully.
+- APPLY the information to your current task — this is why it was stored.
+- If you see user preferences, FOLLOW THEM without asking.
+- If you see past decisions or architecture notes, BUILD ON THEM.
+- Do NOT ignore retrieved context — it was stored specifically to help you.
+
+SECTIONS IN OUTPUT:
+- [Core Memory]: Identity and critical permanent facts — always relevant.
+- [Current Session]: What happened so far in this conversation.
 - [Current Session Notes]: Compressed notes from this session.
 - [Known Facts]: Structured knowledge graph relationships.
-- [Past Sessions]: Summaries from previous conversations.
-- [Long-term Knowledge]: High-level themes and patterns.
+- [Past Sessions]: Summaries from previous conversations — check for patterns.
+- [Long-term Knowledge]: High-level themes and recurring patterns.
 - [Semantic Matches]: Contextually similar memories from any time.
 
-The output includes a metadata footer showing session ID, source breakdown, and token usage.`,
+TIP: Use a higher token_budget (5000-8000) when starting a conversation to get comprehensive context. Use lower (1000-2000) for focused mid-conversation lookups.`,
                 inputSchema: {
                     type: "object" as const,
                     properties: {
                         query: {
                             type: "string",
-                            description: "What to search for. Use natural language — semantic search handles the rest.",
+                            description: "What to search for. Be descriptive — include project names, tech stack, topic areas. Example: 'user website fate.rf.gd design preferences audio visualizer' rather than just 'website'.",
                         },
                         token_budget: {
                             type: "integer",
-                            description: "Max tokens to return. Default 3000. Increase for broad context, decrease for focused queries.",
+                            description: "Max tokens to return. Default 3000. Use 5000-8000 for broad conversation-start context. Use 1000-2000 for focused lookups.",
                         },
                         filters: {
                             type: "object",
@@ -321,6 +349,11 @@ SHOWS: Tier counts, token estimates, knowledge graph size, vector store count, a
                         lines.push("No previous session to archive (first session).");
                     }
 
+                    // Remind the LLM to follow the mandatory workflow
+                    lines.push("");
+                    lines.push("NEXT STEP: Call memory_retrieve NOW with query 'user preferences projects overview' and token_budget 5000 to load context for this conversation.");
+                    lines.push("THEN: Throughout this conversation, call memory_store to save DETAILED notes (3-5+ sentences each) about tasks, decisions, and discoveries.");
+
                     return { content: [{ type: "text" as const, text: lines.join("\n") }] };
                 }
 
@@ -337,7 +370,29 @@ SHOWS: Tier counts, token estimates, knowledge graph size, vector store count, a
                         };
                     }
 
+                    // ── Content quality enforcement ──
+                    // Reject entries that are too terse to be useful in future retrieval.
+                    // A single sentence like "Fixed audio issue" wastes storage and forces
+                    // re-derivation later — the whole point of memory is to AVOID that.
+                    const wordCount = content.trim().split(/\s+/).length;
+                    const sentenceCount = (content.match(/[.!?;]\s|[.!?;]$/g) || []).length;
+
+                    if (wordCount < 10) {
+                        return {
+                            content: [{
+                                type: "text" as const,
+                                text: `REJECTED: Memory too short (${wordCount} words). Entries must be detailed, self-contained paragraphs (3-5+ sentences, 10+ words minimum). Your entry: "${content.substring(0, 80)}"\n\nRewrite with full context: WHO/WHAT/WHY/HOW/WHERE. Example:\nBAD:  "Fixed audio issue"\nGOOD: "Fixed a CORS audio playback issue on the user's website fate.rf.gd. The <audio> element was trying to load files cross-origin. Solution: added crossorigin='anonymous' and configured server CORS headers. Audio visualizer now works with Vanta.js background."\n\nPlease resubmit with a detailed version.`
+                            }],
+                            isError: true,
+                        };
+                    }
+
                     const result = await storeMemory(content, memoryType, confidence, entities);
+
+                    // Build response with quality feedback
+                    const qualityNote = wordCount < 25
+                        ? "\n⚠️ Entry is brief. Consider adding more context (WHY, HOW, specifics) for better future retrieval."
+                        : "";
 
                     const response = [
                         `Stored as ${result.memoryType} (Tier ${result.tier})`,
@@ -348,6 +403,7 @@ SHOWS: Tier counts, token estimates, knowledge graph size, vector store count, a
                             ? `Entities: ${result.entitiesCreated.join(", ")}`
                             : null,
                         result.vectorId ? `Vector indexed` : null,
+                        qualityNote || null,
                     ]
                         .filter(Boolean)
                         .join("\n");

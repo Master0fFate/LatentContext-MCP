@@ -1,6 +1,7 @@
 import initSqlJs, { type Database as SqlJsDatabase } from "sql.js";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
-import { join } from "path";
+import { join, dirname } from "path";
+import { createRequire } from "module";
 import { getConfig } from "./config.js";
 
 // ---------------------------------------------------------------------------
@@ -159,6 +160,8 @@ let _saveTimer: ReturnType<typeof setTimeout> | null = null;
 
 /**
  * Initialize the database. Must be called before any operations.
+ * Explicitly locates the sql.js WASM binary to avoid resolution issues
+ * on Windows when spawned as a child process.
  */
 export async function initDatabase(): Promise<SqlJsDatabase> {
     if (_db) return _db;
@@ -172,7 +175,28 @@ export async function initDatabase(): Promise<SqlJsDatabase> {
 
     _dbPath = join(dataDir, config.storage.sqliteFile);
 
-    const SQL = await initSqlJs();
+    // Locate the sql.js WASM binary explicitly.
+    // When spawned as an MCP subprocess, the CWD may not be the package directory,
+    // causing sql.js to fail to find its own WASM file.
+    let wasmPath: string | undefined;
+    try {
+        const require = createRequire(import.meta.url);
+        const sqlJsPath = require.resolve("sql.js");
+        const sqlJsDir = dirname(sqlJsPath);
+        const candidatePath = join(sqlJsDir, "sql-wasm.wasm");
+        if (existsSync(candidatePath)) {
+            wasmPath = candidatePath;
+        }
+    } catch {
+        // Fallback: let sql.js find its own WASM file
+    }
+
+    const sqlJsConfig: Record<string, unknown> = {};
+    if (wasmPath) {
+        sqlJsConfig.locateFile = () => wasmPath;
+    }
+
+    const SQL = await initSqlJs(sqlJsConfig);
 
     // Load existing database or create new one
     if (existsSync(_dbPath)) {
