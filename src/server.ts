@@ -15,6 +15,7 @@ import {
     getCoreMemory,
     getCurrentSessionMemory,
     archiveWorkingMemory,
+    clearWorkingMemory,
     type MemoryType,
     type CompressScope,
     type ForgetAction,
@@ -64,16 +65,20 @@ export function createServer(): Server {
 
 MANDATORY WORKFLOW — follow these steps IN ORDER every single time:
 1. Call session_start (this tool) FIRST.
-2. IMMEDIATELY after, call memory_retrieve with a broad query about the user and their projects.
-3. READ the retrieved context carefully and use it to inform your responses.
-4. Throughout the conversation, call memory_store to save DETAILED notes about everything important.
+2. IMMEDIATELY after, call memory_retrieve to check for any context from this session.
+3. Throughout the conversation, call memory_store to save DETAILED notes about everything important.
+
+SESSION ISOLATION:
+- Each session starts with ZERO entries — completely fresh memory.
+- No data from past sessions, knowledge graph, or vector store leaks in.
+- Only data stored via memory_store during THIS session will be retrievable.
+- Session IDs are timestamp-prefixed UUIDs for guaranteed uniqueness.
 
 WHAT IT DOES:
-- Archives the previous session's working memory into long-term storage.
-- Creates a fresh, empty working memory for the new conversation.
-- Returns the new session ID and a summary of what was archived.
+- Creates a completely fresh, empty memory for the new conversation.
+- Returns the new session ID.
 
-WARNING: If you skip this, memories from the previous conversation will leak into the current one. Always call this first, then ALWAYS call memory_retrieve right after.`,
+WARNING: Always call this first to ensure session isolation.`,
                 inputSchema: {
                     type: "object" as const,
                     properties: {},
@@ -144,34 +149,31 @@ ENTITIES: Always provide relevant entity names in the 'entities' array for 'fact
             {
                 name: "memory_retrieve",
                 description:
-                    `Retrieve relevant memories for a query. Returns ranked, deduplicated context organized by session.
+                    `Retrieve memories stored in the CURRENT session. Returns only data from this conversation — no cross-session contamination.
 
-MANDATORY — ALWAYS call this immediately after session_start. Also call before ANY task that could benefit from prior knowledge.
+MANDATORY — ALWAYS call this immediately after session_start. Also call before ANY task that could benefit from context stored earlier in this conversation.
 
 WHEN TO USE:
-- IMMEDIATELY after session_start — use query "user preferences projects overview" to load broad context.
-- BEFORE answering questions that might benefit from prior knowledge about the user or their projects.
-- When the user references something from a previous conversation.
-- When you need to recall previous decisions, implementations, or preferences.
-- Before starting any coding task — retrieve context about the project's architecture, tech stack, and past decisions.
+- IMMEDIATELY after session_start — to check if there is any context from earlier in this session.
+- When you need to recall what was discussed/decided/stored earlier in THIS conversation.
+- Before starting a new task step — retrieve context about what was done so far.
 
 HOW TO USE THE RESULTS:
 - READ every section of the returned context carefully.
 - APPLY the information to your current task — this is why it was stored.
-- If you see user preferences, FOLLOW THEM without asking.
-- If you see past decisions or architecture notes, BUILD ON THEM.
+- If you see stored decisions or notes, BUILD ON THEM.
 - Do NOT ignore retrieved context — it was stored specifically to help you.
 
-SECTIONS IN OUTPUT:
-- [Core Memory]: Identity and critical permanent facts — always relevant.
-- [Current Session]: What happened so far in this conversation.
-- [Current Session Notes]: Compressed notes from this session.
-- [Known Facts]: Structured knowledge graph relationships.
-- [Past Sessions]: Summaries from previous conversations — check for patterns.
-- [Long-term Knowledge]: High-level themes and recurring patterns.
-- [Semantic Matches]: Contextually similar memories from any time.
+SESSION ISOLATION:
+- Each session starts with ZERO entries — completely fresh.
+- Only returns data stored via memory_store during THIS session.
+- No data from past sessions, global knowledge graph, or vector store is included.
 
-TIP: Use a higher token_budget (5000-8000) when starting a conversation to get comprehensive context. Use lower (1000-2000) for focused mid-conversation lookups.`,
+SECTIONS IN OUTPUT:
+- [Current Session]: What has been stored so far in this conversation.
+- [Current Session Notes]: Compressed notes from this session (if working memory was compressed).
+
+TIP: Use a higher token_budget (5000-8000) for comprehensive context. Use lower (1000-2000) for focused lookups.`,
                 inputSchema: {
                     type: "object" as const,
                     properties: {
@@ -208,39 +210,7 @@ TIP: Use a higher token_budget (5000-8000) when starting a conversation to get c
                     },
                     required: ["query"],
                 },
-            },
-            {
-                name: "graph_query",
-                description:
-                    `Query the knowledge graph for structured facts about specific entities and their relationships.
 
-WHEN TO USE:
-- When you need to look up specific facts about the user, their projects, or any named entity.
-- When the user asks "what do you know about X?".
-- To check if a fact already exists before storing a new one.
-
-WHAT YOU GET BACK: Structured entity information with outgoing and incoming relationships.
-Example output: "Entity: User (person) → prefers → dark mode → works_at → ExampleCorp"
-
-DEPTH: Set depth > 1 to discover indirect relationships (e.g., depth 2 finds friends-of-friends).`,
-                inputSchema: {
-                    type: "object" as const,
-                    properties: {
-                        entity: {
-                            type: "string",
-                            description: "Entity to look up (case-insensitive). Example: 'User', 'JavaScript', 'fate.rf.gd'.",
-                        },
-                        relation: {
-                            type: "string",
-                            description: "Optional predicate filter (e.g., 'prefers', 'located_in', 'works_at', 'uses'). Only returns matching relationships.",
-                        },
-                        depth: {
-                            type: "integer",
-                            description: "Graph traversal hops. Default 1. Set to 2 to include neighbors' relationships.",
-                        },
-                    },
-                    required: ["entity"],
-                },
             },
             {
                 name: "memory_compress",
@@ -335,24 +305,20 @@ SHOWS: Tier counts, token estimates, knowledge graph size, vector store count, a
                         return archiveWorkingMemory(oldSessionId);
                     });
 
+                    // Clear ALL working memory to guarantee complete session isolation.
+                    // No data from previous sessions should leak into the new one.
+                    clearWorkingMemory();
+
                     const lines = [
                         `New session started: ${result.sessionId}`,
                         `Started at: ${result.startedAt}`,
+                        `Session is COMPLETELY FRESH — zero entries from past sessions.`,
                     ];
-
-                    if (result.previousSessionArchived && result.previousSessionId) {
-                        lines.push(`Previous session archived: ${result.previousSessionId}`);
-                        lines.push(`Archive: ${result.archiveSummary}`);
-                    } else if (result.previousSessionId) {
-                        lines.push(`Previous session ended: ${result.previousSessionId} (no data to archive)`);
-                    } else {
-                        lines.push("No previous session to archive (first session).");
-                    }
 
                     // Remind the LLM to follow the mandatory workflow
                     lines.push("");
-                    lines.push("NEXT STEP: Call memory_retrieve NOW with query 'user preferences projects overview' and token_budget 5000 to load context for this conversation.");
-                    lines.push("THEN: Throughout this conversation, call memory_store to save DETAILED notes (3-5+ sentences each) about tasks, decisions, and discoveries.");
+                    lines.push("Throughout this conversation, call memory_store to save DETAILED notes (3-5+ sentences each) about tasks, decisions, and discoveries.");
+                    lines.push("Call memory_retrieve at any time to recall what was stored earlier in THIS session.");
 
                     return { content: [{ type: "text" as const, text: lines.join("\n") }] };
                 }
@@ -444,43 +410,6 @@ SHOWS: Tier counts, token estimates, knowledge graph size, vector store count, a
                     return { content: [{ type: "text" as const, text: result.text }] };
                 }
 
-                case "graph_query": {
-                    const entity = args?.entity as string;
-                    const relation = args?.relation as string | undefined;
-                    const depth = (args?.depth as number) ?? 1;
-
-                    if (!entity) {
-                        return {
-                            content: [{ type: "text" as const, text: "Error: 'entity' is required." }],
-                            isError: true,
-                        };
-                    }
-
-                    if (relation) {
-                        const facts = queryByPredicate(relation).filter(
-                            (f) =>
-                                f.subject.toLowerCase().includes(entity.toLowerCase()) ||
-                                f.object.toLowerCase().includes(entity.toLowerCase())
-                        );
-                        return {
-                            content: [{ type: "text" as const, text: serializeFacts(facts) }],
-                        };
-                    }
-
-                    const result = queryEntity(entity, depth);
-                    if (!result) {
-                        return {
-                            content: [
-                                {
-                                    type: "text" as const,
-                                    text: `No knowledge graph entries found for "${entity}".`,
-                                },
-                            ],
-                        };
-                    }
-
-                    return { content: [{ type: "text" as const, text: result.serialized }] };
-                }
 
                 case "memory_compress": {
                     const scope = (args?.scope || "working") as CompressScope;

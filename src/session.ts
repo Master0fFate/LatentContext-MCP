@@ -74,9 +74,12 @@ export async function startSession(
         endSessionRecord(_currentSessionId);
     }
 
-    // Generate new session
-    _currentSessionId = uuidv4();
-    _sessionStartedAt = new Date().toISOString();
+    // Generate new session with timestamp-prefixed ID for guaranteed uniqueness.
+    // Format: {unixTimestampMs}-{uuid} — the timestamp ensures temporal uniqueness
+    // even if UUID somehow collides (which is already astronomically unlikely).
+    const timestamp = Date.now();
+    _currentSessionId = `${timestamp}-${uuidv4()}`;
+    _sessionStartedAt = new Date(timestamp).toISOString();
 
     result.sessionId = _currentSessionId;
     result.startedAt = _sessionStartedAt;

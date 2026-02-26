@@ -129,6 +129,13 @@ export function getWorkingMemoryCount(): number {
 }
 
 /**
+ * Clear ALL working memory. Called on session start to guarantee
+ * complete session isolation — no residual data from previous sessions.
+ */
+export function clearWorkingMemory(): void {
+    _workingMemory.length = 0;
+}
+/**
  * Archive all current session working memory into a Tier 1 summary.
  * Called during session transitions to preserve data before clearing.
  * Returns the archive summary text, or null if nothing to archive.

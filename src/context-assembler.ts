@@ -163,19 +163,20 @@ function extractEntityMentions(query: string): string[] {
 // ---------------------------------------------------------------------------
 
 /**
- * Assemble the optimal context payload for a given query within a token budget.
+ * Assemble the context payload for a given query within a token budget.
+ *
+ * SESSION ISOLATION: This function ONLY returns data from the CURRENT session.
+ * It does NOT pull from past sessions, the global knowledge graph, or the
+ * global vector store. Each session starts with zero memory and the AI fills
+ * it during the conversation.
  *
  * Algorithm:
- * 1. Always include Tier 3 core memory
- * 2. Include current session working memory (Tier 0)
- * 3. Embed query → vector search (top 20 candidates)
- * 4. Extract entity mentions → knowledge graph queries
- * 5. Gather current session Tier 1 summaries
- * 6. Gather past-session Tier 1 and Tier 2 summaries
- * 7. Score all candidates by composite relevance
- * 8. Deduplicate
- * 9. Greedily fill budget by score
- * 10. Format output with session-aware section headers
+ * 1. Include current session working memory (Tier 0)
+ * 2. Include current session Tier 1 summaries (compressed working memory)
+ * 3. Score all candidates by composite relevance
+ * 4. Deduplicate
+ * 5. Greedily fill budget by score
+ * 6. Format output with section headers
  */
 export async function assembleContext(
     query: string,
@@ -190,22 +191,8 @@ export async function assembleContext(
     const candidates: ContextCandidate[] = [];
     const sourceCounts: Record<string, number> = {};
 
-    // ── 1. Always include Core Memory (Tier 3) ──
-    const coreMemory = getCoreMemory();
-    const coreTokens = countTokens(coreMemory);
-    let coreSection = "";
-
-    if (coreMemory !== "No core memories stored yet." && coreTokens > 0) {
-        const { text: coreTruncated } = truncateToTokenBudget(
-            coreMemory,
-            Math.min(coreTokens, config.tokenBudgets.tier3Core)
-        );
-        coreSection = `[Core Memory] ${coreTruncated}`;
-        remainingBudget -= countTokens(coreSection);
-        sourceCounts["core"] = 1;
-    }
-
-    // ── 2. Current session working memory (Tier 0) ──
+    // ── 1. Current session working memory (Tier 0) ──
+    // This is the in-memory buffer of entries stored during THIS session
     const workingMem = getWorkingMemory();
     if (workingMem && workingMem.length > 0) {
         const wmTokens = countTokens(workingMem);
@@ -223,64 +210,11 @@ export async function assembleContext(
         });
     }
 
-    // ── 3. Vector search ──
-    try {
-        const vectorResults = await searchVectors(query, 20, filters);
-        for (const vr of vectorResults) {
-            if (vr.similarity < 0.3) continue; // Skip low-relevance results
-
-            const freq = getAccessFrequency(vr.id);
-            candidates.push({
-                id: vr.id,
-                content: vr.contentPreview,
-                tokens: countTokens(vr.contentPreview),
-                score: 0,
-                source: "vector",
-                similarity: vr.similarity,
-                recency: recencyScore(vr.createdAt),
-                priority: sourcePriority(vr.sourceType === "core" ? "core" : "vector"),
-                frequency: Math.min(freq / 10, 1.0),
-                createdAt: vr.createdAt,
-            });
-        }
-    } catch {
-        // Vector search failure is non-fatal (e.g., embedding model not loaded)
-    }
-
-    // ── 4. Knowledge graph queries ──
-    const entityMentions = extractEntityMentions(query);
-    const graphContents: string[] = [];
-
-    for (const entity of entityMentions.slice(0, 5)) {
-        const result = queryEntity(entity, 2);
-        if (result) {
-            graphContents.push(result.serialized);
-            logAccess(result.entity.id, "entity");
-        }
-    }
-
-    if (graphContents.length > 0) {
-        const graphText = graphContents.join("\n\n");
-        const graphTokens = countTokens(graphText);
-
-        candidates.push({
-            id: "graph-" + entityMentions.join("-"),
-            content: graphText,
-            tokens: graphTokens,
-            score: 0,
-            source: "graph",
-            similarity: 0.7,
-            recency: 1.0,
-            priority: sourcePriority("graph"),
-            frequency: 0.5,
-            createdAt: new Date().toISOString(),
-        });
-    }
-
-    // ── 5. Current session Tier 1 summaries ──
+    // ── 2. Current session Tier 1 summaries (compressed working memory) ──
+    // These are created when working memory overflows and gets compressed
     if (sessionId) {
         const currentSessionSummaries = getSummariesByTierAndSession(1, sessionId);
-        for (const summary of currentSessionSummaries.slice(0, 5)) {
+        for (const summary of currentSessionSummaries) {
             const freq = getAccessFrequency(summary.id);
             candidates.push({
                 id: summary.id,
@@ -297,44 +231,18 @@ export async function assembleContext(
         }
     }
 
-    // ── 6. Past session Tier 1 and Tier 2 summaries ──
-    const pastTier1 = sessionId
-        ? getSummariesByTierExcludingSession(1, sessionId)
-        : getSummariesByTier(1);
-    for (const summary of pastTier1.slice(0, 10)) {
-        const freq = getAccessFrequency(summary.id);
-        candidates.push({
-            id: summary.id,
-            content: summary.content,
-            tokens: summary.token_count,
-            score: 0,
-            source: "past_sessions",
-            similarity: 0.5,
-            recency: recencyScore(summary.created_at),
-            priority: sourcePriority("past_sessions"),
-            frequency: Math.min(freq / 10, 1.0),
-            createdAt: summary.created_at,
-        });
-    }
+    // ── NOTE: The following sources are intentionally EXCLUDED ──
+    // - Core memory (Tier 3): Global data from past sessions → NOT included
+    // - Vector search: Global vectors from all sessions → NOT included
+    // - Knowledge graph: Global entities/relations from all sessions → NOT included
+    // - Past session summaries (Tier 1 from other sessions): NOT included
+    // - Epoch summaries (Tier 2): NOT included
+    //
+    // Each session starts COMPLETELY FRESH with zero entries. The AI fills
+    // memory during the conversation and only retrieves what was stored in
+    // THIS specific session.
 
-    const tier2Summaries = getSummariesByTier(2);
-    for (const summary of tier2Summaries.slice(0, 5)) {
-        const freq = getAccessFrequency(summary.id);
-        candidates.push({
-            id: summary.id,
-            content: summary.content,
-            tokens: summary.token_count,
-            score: 0,
-            source: "long_term",
-            similarity: 0.4,
-            recency: recencyScore(summary.created_at),
-            priority: sourcePriority("long_term"),
-            frequency: Math.min(freq / 10, 1.0),
-            createdAt: summary.created_at,
-        });
-    }
-
-    // ── 7. Compute composite scores ──
+    // ── 3. Compute composite scores ──
     const weights = config.ranking;
     for (const candidate of candidates) {
         candidate.score =
@@ -344,10 +252,10 @@ export async function assembleContext(
             weights.frequencyWeight * candidate.frequency;
     }
 
-    // ── 8. Deduplicate ──
+    // ── 4. Deduplicate ──
     const deduped = deduplicate(candidates, weights.dedupSimilarityThreshold);
 
-    // ── 9. Sort by score and greedily fill budget ──
+    // ── 5. Sort by score and greedily fill budget ──
     deduped.sort((a, b) => b.score - a.score);
 
     const selected: ContextCandidate[] = [];
@@ -362,13 +270,8 @@ export async function assembleContext(
         }
     }
 
-    // ── 10. Format output with session-aware sections ──
+    // ── 6. Format output with section headers ──
     const sections: string[] = [];
-
-    // Core Memory always first
-    if (coreSection) {
-        sections.push(coreSection);
-    }
 
     // Group selected candidates by source
     const bySource: Record<string, ContextCandidate[]> = {};
@@ -377,15 +280,11 @@ export async function assembleContext(
         bySource[s.source].push(s);
     }
 
-    // Define section order and labels — session-scoped then cross-session
-    const sourceOrder = ["working", "current_session", "graph", "long_term", "past_sessions", "vector"];
+    // Define section order and labels — current session only
+    const sourceOrder = ["working", "current_session"];
     const sourceLabels: Record<string, string> = {
         working: "Current Session",
         current_session: "Current Session Notes",
-        graph: "Known Facts",
-        long_term: "Long-term Knowledge",
-        past_sessions: "Past Sessions",
-        vector: "Semantic Matches",
     };
 
     for (const source of sourceOrder) {
@@ -408,10 +307,10 @@ export async function assembleContext(
             .map(([source, count]) => `${source}:${count}`)
             .join(", ");
         const budgetUsed = budget - remainingBudget;
-        const sessionLabel = sessionId ? sessionId.substring(0, 8) : "none";
+        const sessionLabel = sessionId ? sessionId.substring(0, 20) : "none";
         finalText += `\n\n--- Session: ${sessionLabel} | Sources: ${sourceList} | Tokens: ${budgetUsed}/${budget} ---`;
     } else {
-        finalText = "No relevant memories found. This appears to be a new conversation — use memory_store to save important information as you go.";
+        finalText = "No memories stored in this session yet. This is a fresh session — use memory_store to save important information as you go.";
     }
 
     const totalTokens = countTokens(finalText);
@@ -423,7 +322,7 @@ export async function assembleContext(
         budgetRemaining: remainingBudget,
         sourceCounts,
         candidatesConsidered: candidates.length,
-        candidatesSelected: selected.length + (coreSection ? 1 : 0),
+        candidatesSelected: selected.length,
         sessionId,
     };
 }
