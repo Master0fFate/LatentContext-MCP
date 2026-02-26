@@ -69,16 +69,16 @@ const DEFAULT_CONFIG: LatentContextConfig = {
         dimensions: 384,
     },
     tokenBudgets: {
-        tier0Working: 2000,
-        tier1Session: 500,
-        tier2Epoch: 300,
-        tier3Core: 200,
-        retrieval: 2000,
-        graphFacts: 500,
-        defaultRetrieveBudget: 3000,
+        tier0Working: 16000,        // Working memory buffer — plenty of room for detailed entries
+        tier1Session: 4000,         // Compressed session summaries retain more detail
+        tier2Epoch: 2000,           // Epoch-level long-term knowledge
+        tier3Core: 1000,            // Permanent core facts about the user
+        retrieval: 8000,            // How much context can be retrieved per query
+        graphFacts: 2000,           // Knowledge graph facts budget
+        defaultRetrieveBudget: 8000, // Default budget when LLM doesn't specify one
     },
     compression: {
-        tier0OverflowThreshold: 2500,
+        tier0OverflowThreshold: 20000, // Compress when working memory exceeds 20K tokens
         tier1ConsolidationCount: 10,
         confidenceDecayRate: 0.01,
         confidenceDecayIntervalHours: 24,

@@ -103,9 +103,9 @@ This prevents the common failure mode where the AI stores useless entries like `
 
 ```
 Tier 0 (Working):   In-memory buffer of entries from the current session.
-                     Auto-compresses when token count exceeds threshold (~2500 tokens).
+                     Auto-compresses when token count exceeds threshold (~20K tokens).
 
-Tier 1 (Session):   Compressed summaries of overflowed working memory.
+Tier 1 (Session):   Compressed summaries of overflowed working memory (up to ~4K tokens each).
                      Created automatically or via memory_compress scope='working'.
 ```
 
@@ -160,12 +160,12 @@ Create `latentcontext.config.json` in the project root to override defaults:
     "dimensions": 384
   },
   "tokenBudgets": {
-    "defaultRetrieveBudget": 3000,
-    "tier0Working": 2000,
-    "tier1Session": 500
+    "defaultRetrieveBudget": 8000,
+    "tier0Working": 16000,
+    "tier1Session": 4000
   },
   "compression": {
-    "tier0OverflowThreshold": 2500
+    "tier0OverflowThreshold": 20000
   },
   "session": {
     "autoStartOnBoot": true
