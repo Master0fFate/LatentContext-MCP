@@ -141,17 +141,33 @@ src/
 ### Platform Notes (Windows)
 
 - The server automatically hides its console window ~1-2 seconds after startup using the Win32 API (`GetConsoleWindow` + `ShowWindow`). Do not manually close the Node.js window — it is the running server process.
-- All `console.*` output and `process.stderr.write` are redirected to `data/server.log` to prevent stdio corruption of the MCP JSON-RPC protocol.
+- All `console.*`, stray `stdout`, and `stderr` output is redirected to `server.log` in LatentContext's dedicated data directory to prevent stdio corruption of the MCP JSON-RPC protocol.
 - The sql.js WASM binary is explicitly resolved via `createRequire` to handle Windows path resolution edge cases.
 
 ## Configuration
 
-Create `latentcontext.config.json` in the project root to override defaults:
+LatentContext intentionally does **not** store data in the project opened by your IDE. By default, it uses a dedicated per-user data directory:
+
+| Platform | Default data directory |
+|---|---|
+| Windows | `%LOCALAPPDATA%\LatentContext-MCP` |
+| macOS | `~/Library/Application Support/LatentContext-MCP` |
+| Linux | `${XDG_STATE_HOME:-~/.local/state}/latentcontext-mcp` |
+
+To override the location, set environment variables in your MCP host configuration:
+
+| Variable | Purpose |
+|---|---|
+| `LATENTCONTEXT_DATA_DIR` | Absolute path for `memory.db` and `server.log`. |
+| `LATENTCONTEXT_CONFIG` | Absolute path to a `latentcontext.config.json` file. |
+| `LATENTCONTEXT_ALLOW_PROJECT_CONFIG=1` | Opt in to reading `latentcontext.config.json` from the host process CWD. Disabled by default to avoid project contamination. |
+
+You can place `latentcontext.config.json` in the dedicated data directory, pass it with `LATENTCONTEXT_CONFIG`, or place it beside the installed package. Relative `storage.dataDir` values are resolved relative to the config file, not the opened IDE project.
 
 ```json
 {
   "storage": {
-    "dataDir": "./data",
+    "dataDir": "C:/Users/you/AppData/Local/LatentContext-MCP",
     "sqliteFile": "memory.db"
   },
   "embedding": {
@@ -177,7 +193,7 @@ Set `"provider": "none"` to disable embeddings entirely (vector indexing will be
 
 ## Data Storage
 
-All data is stored locally in `./data/memory.db` (SQLite via WASM). No data leaves your machine. The database contains tables for entities, relations, summaries (tiered), vectors (embeddings), access logs, and sessions.
+All data is stored locally in the dedicated data directory as `memory.db` (SQLite via WASM). Runtime diagnostics are written to `server.log` in the same directory. No data leaves your machine. The database contains tables for entities, relations, summaries (tiered), vectors (embeddings), access logs, and sessions.
 
 ## Resources
 

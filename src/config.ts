@@ -1,5 +1,7 @@
 import { readFileSync, existsSync } from "fs";
-import { join } from "path";
+import { basename, dirname, isAbsolute, join, resolve } from "path";
+import { homedir } from "os";
+import { fileURLToPath } from "url";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -54,13 +56,20 @@ export interface LatentContextConfig {
     session: SessionConfig;
 }
 
+export const CONFIG_FILE_NAME = "latentcontext.config.json";
+export const DATA_DIR_ENV = "LATENTCONTEXT_DATA_DIR";
+export const CONFIG_PATH_ENV = "LATENTCONTEXT_CONFIG";
+export const ALLOW_PROJECT_CONFIG_ENV = "LATENTCONTEXT_ALLOW_PROJECT_CONFIG";
+
+const APP_DIR_NAME = "LatentContext-MCP";
+
 // ---------------------------------------------------------------------------
 // Defaults
 // ---------------------------------------------------------------------------
 
 const DEFAULT_CONFIG: LatentContextConfig = {
     storage: {
-        dataDir: "./data",
+        dataDir: "",
         sqliteFile: "memory.db",
     },
     embedding: {
@@ -95,6 +104,72 @@ const DEFAULT_CONFIG: LatentContextConfig = {
     },
 };
 
+function getPackageRoot(): string {
+    const moduleDir = dirname(fileURLToPath(import.meta.url));
+    const leaf = basename(moduleDir);
+    if (leaf === "src" || leaf === "dist") {
+        return dirname(moduleDir);
+    }
+    return moduleDir;
+}
+
+function resolvePath(pathValue: string, baseDir: string = process.cwd()): string {
+    return isAbsolute(pathValue) ? pathValue : resolve(baseDir, pathValue);
+}
+
+function envFlagEnabled(value: string | undefined): boolean {
+    return value === "1" || value?.toLowerCase() === "true";
+}
+
+export function getDefaultDataDir(
+    env: NodeJS.ProcessEnv = process.env,
+    homeDir: string = homedir(),
+    platform: NodeJS.Platform = process.platform
+): string {
+    const explicit = env[DATA_DIR_ENV]?.trim();
+    if (explicit) {
+        return resolvePath(explicit);
+    }
+
+    if (platform === "win32") {
+        const localAppData = env.LOCALAPPDATA || env.APPDATA;
+        return localAppData
+            ? join(localAppData, APP_DIR_NAME)
+            : join(homeDir, "AppData", "Local", APP_DIR_NAME);
+    }
+
+    if (platform === "darwin") {
+        return join(homeDir, "Library", "Application Support", APP_DIR_NAME);
+    }
+
+    const stateHome = env.XDG_STATE_HOME || join(homeDir, ".local", "state");
+    return join(stateHome, "latentcontext-mcp");
+}
+
+function getConfigSearchPaths(configPath: string | undefined, defaultDataDir: string): string[] {
+    const paths: string[] = [];
+
+    if (configPath) {
+        paths.push(resolvePath(configPath));
+    }
+
+    const envConfigPath = process.env[CONFIG_PATH_ENV]?.trim();
+    if (envConfigPath) {
+        paths.push(resolvePath(envConfigPath));
+    }
+
+    paths.push(join(defaultDataDir, CONFIG_FILE_NAME));
+    paths.push(join(getPackageRoot(), CONFIG_FILE_NAME));
+
+    // Project-level config is opt-in because MCP hosts often launch servers
+    // with the user's current project as CWD.
+    if (envFlagEnabled(process.env[ALLOW_PROJECT_CONFIG_ENV])) {
+        paths.push(join(process.cwd(), CONFIG_FILE_NAME));
+    }
+
+    return [...new Set(paths)];
+}
+
 // ---------------------------------------------------------------------------
 // Loader
 // ---------------------------------------------------------------------------
@@ -127,24 +202,22 @@ function deepMerge(
 }
 
 let _config: LatentContextConfig | null = null;
+let _configSource: string | null = null;
 
 export function loadConfig(configPath?: string): LatentContextConfig {
     if (_config) return _config;
 
     let userConfig: Record<string, unknown> = {};
+    let configBaseDir: string | null = null;
+    const defaultDataDir = getDefaultDataDir();
 
-    // Determine config file location
-    const searchPaths: string[] = [];
-    if (configPath) {
-        searchPaths.push(configPath);
-    }
-    searchPaths.push(join(process.cwd(), "latentcontext.config.json"));
-
-    for (const p of searchPaths) {
+    for (const p of getConfigSearchPaths(configPath, defaultDataDir)) {
         if (existsSync(p)) {
             try {
                 const raw = readFileSync(p, "utf-8");
                 userConfig = JSON.parse(raw) as Record<string, unknown>;
+                _configSource = p;
+                configBaseDir = dirname(p);
                 break;
             } catch {
                 // ignore malformed config, use defaults
@@ -159,9 +232,16 @@ export function loadConfig(configPath?: string): LatentContextConfig {
 
     _config = merged;
 
-    // Resolve dataDir to absolute path
-    if (!_config.storage.dataDir.startsWith("/") && !_config.storage.dataDir.match(/^[A-Za-z]:\\/)) {
-        _config.storage.dataDir = join(process.cwd(), _config.storage.dataDir);
+    const envDataDir = process.env[DATA_DIR_ENV]?.trim();
+    if (envDataDir) {
+        _config.storage.dataDir = resolvePath(envDataDir);
+    } else if (!_config.storage.dataDir) {
+        _config.storage.dataDir = defaultDataDir;
+    } else {
+        _config.storage.dataDir = resolvePath(
+            _config.storage.dataDir,
+            configBaseDir ?? getPackageRoot()
+        );
     }
 
     return _config;
@@ -174,4 +254,9 @@ export function getConfig(): LatentContextConfig {
 
 export function resetConfig(): void {
     _config = null;
+    _configSource = null;
+}
+
+export function getConfigSource(): string | null {
+    return _configSource;
 }

@@ -1,6 +1,6 @@
 {
     "name": "latentcontext-mcp",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "description": "LatentContext MCP Server — Intelligent memory and context management for LLMs",
     "type": "module",
     "main": "dist/index.js",
@@ -10,7 +10,8 @@
     "scripts": {
         "build": "tsc",
         "start": "node dist/index.js",
-        "dev": "tsx src/index.ts"
+        "dev": "tsx src/index.ts",
+        "test": "node --import tsx --test tests/*.test.ts"
     },
     "keywords": [
         "mcp",

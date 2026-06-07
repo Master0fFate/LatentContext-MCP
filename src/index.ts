@@ -8,6 +8,8 @@ import { startSession, endCurrentSession } from "./session.js";
 import { writeFileSync, appendFileSync, mkdirSync, existsSync } from "fs";
 import { join } from "path";
 import { spawn } from "child_process";
+import type { Writable } from "stream";
+import { getConfigSource } from "./config.js";
 
 // ---------------------------------------------------------------------------
 // Stdio-safe logging: NEVER write to stdout (reserved for MCP JSON-RPC).
@@ -15,6 +17,16 @@ import { spawn } from "child_process";
 // ---------------------------------------------------------------------------
 
 let _logPath: string | null = null;
+
+function createMcpStdout(): Writable {
+    const originalWrite = process.stdout.write.bind(process.stdout);
+    const originalOnce = process.stdout.once.bind(process.stdout);
+
+    return {
+        write: originalWrite,
+        once: originalOnce,
+    } as unknown as Writable;
+}
 
 function initLogFile(): void {
     try {
@@ -57,8 +69,6 @@ function logToFile(level: string, message: string, error?: unknown): void {
 // ---------------------------------------------------------------------------
 
 function suppressConsole(): void {
-    const noop = () => { };
-
     // Override all console methods to route through our file logger
     console.log = (...args: unknown[]) => {
         logToFile("LOG", args.map(String).join(" "));
@@ -82,14 +92,8 @@ function suppressConsole(): void {
     // Also suppress process.stdout.write and process.stderr.write for
     // libraries that bypass console (like @huggingface/transformers
     // progress bars and ONNX runtime status messages).
-    // We must preserve the ORIGINAL stdout.write for the MCP transport
-    // to use, but intercept anything that isn't valid JSON-RPC.
-    const originalStdoutWrite = process.stdout.write.bind(process.stdout);
-    const originalStderrWrite = process.stderr.write.bind(process.stderr);
-
-    // Track whether the MCP transport is connected — once connected,
-    // the transport owns stdout. We only allow valid JSON-RPC through.
-    let transportConnected = false;
+    // The MCP transport receives a preserved stdout writer created before
+    // this patch, so anything else that writes to process.stdout is logged.
 
     // Monkey-patch stderr.write to route to log file
     process.stderr.write = ((
@@ -105,10 +109,17 @@ function suppressConsole(): void {
         return true;
     }) as typeof process.stderr.write;
 
-    // Mark transport as connected after a short delay (transport connects in main())
-    setTimeout(() => {
-        transportConnected = true;
-    }, 100);
+    process.stdout.write = ((
+        chunk: string | Uint8Array,
+        encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void),
+        callback?: (error?: Error | null) => void
+    ): boolean => {
+        const text = typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf-8");
+        logToFile("STDOUT", text.trimEnd());
+        const cb = typeof encodingOrCallback === "function" ? encodingOrCallback : callback;
+        if (cb) cb(null);
+        return true;
+    }) as typeof process.stdout.write;
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +127,8 @@ function suppressConsole(): void {
 // ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
+    const mcpStdout = createMcpStdout();
+
     // Step 1: Initialize log file FIRST (before suppressing console)
     initLogFile();
 
@@ -127,6 +140,7 @@ async function main(): Promise<void> {
     // Step 3: Load configuration
     const config = loadConfig();
     logToFile("INFO", `Config loaded. Data dir: ${config.storage.dataDir}`);
+    logToFile("INFO", `Config source: ${getConfigSource() ?? "defaults/env"}`);
 
     // Step 4: Initialize database (creates schema if needed) — async for sql.js WASM init
     try {
@@ -152,7 +166,7 @@ async function main(): Promise<void> {
 
     // Step 6: Create and start the MCP server
     const server = createServer();
-    const transport = new StdioServerTransport();
+    const transport = new StdioServerTransport(process.stdin, mcpStdout);
 
     logToFile("INFO", "MCP server created, connecting transport...");
 

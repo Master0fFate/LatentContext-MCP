@@ -33,6 +33,34 @@ import {
     getCurrentSessionIdOrNull,
 } from "./session.js";
 
+const MEMORY_TYPES = ["fact", "preference", "event", "summary", "core"] as const;
+const COMPRESS_SCOPES = ["working", "session", "epoch"] as const;
+const FORGET_ACTIONS = ["deprecate", "correct", "delete"] as const;
+
+function isMemoryType(value: unknown): value is MemoryType {
+    return typeof value === "string" && MEMORY_TYPES.includes(value as MemoryType);
+}
+
+function isCompressScope(value: unknown): value is CompressScope {
+    return typeof value === "string" && COMPRESS_SCOPES.includes(value as CompressScope);
+}
+
+function isForgetAction(value: unknown): value is ForgetAction {
+    return typeof value === "string" && FORGET_ACTIONS.includes(value as ForgetAction);
+}
+
+function parseStringArray(value: unknown): string[] {
+    if (!Array.isArray(value)) return [];
+    return value.filter((item): item is string => typeof item === "string" && item.trim().length > 0);
+}
+
+function errorText(text: string) {
+    return {
+        content: [{ type: "text" as const, text }],
+        isError: true,
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Create the MCP Server
 // ---------------------------------------------------------------------------
@@ -325,15 +353,27 @@ SHOWS: Tier counts, token estimates, knowledge graph size, vector store count, a
 
                 case "memory_store": {
                     const content = args?.content as string;
-                    const memoryType = (args?.memory_type || "event") as MemoryType;
+                    const rawMemoryType = args?.memory_type || "event";
                     const confidence = (args?.confidence as number) ?? 1.0;
-                    const entities = (args?.entities as string[]) || [];
+                    const entities = parseStringArray(args?.entities);
 
                     if (!content) {
-                        return {
-                            content: [{ type: "text" as const, text: "Error: 'content' is required." }],
-                            isError: true,
-                        };
+                        return errorText("Error: 'content' is required.");
+                    }
+
+                    if (!isMemoryType(rawMemoryType)) {
+                        return errorText(
+                            `Error: 'memory_type' must be one of: ${MEMORY_TYPES.join(", ")}.`
+                        );
+                    }
+
+                    if (
+                        typeof confidence !== "number" ||
+                        Number.isNaN(confidence) ||
+                        confidence < 0 ||
+                        confidence > 1
+                    ) {
+                        return errorText("Error: 'confidence' must be a number between 0 and 1.");
                     }
 
                     // ── Content quality enforcement ──
@@ -353,7 +393,7 @@ SHOWS: Tier counts, token estimates, knowledge graph size, vector store count, a
                         };
                     }
 
-                    const result = await storeMemory(content, memoryType, confidence, entities);
+                    const result = await storeMemory(content, rawMemoryType, confidence, entities);
 
                     // Build response with quality feedback
                     const qualityNote = wordCount < 25
@@ -390,10 +430,14 @@ SHOWS: Tier counts, token estimates, knowledge graph size, vector store count, a
                         | undefined;
 
                     if (!query) {
-                        return {
-                            content: [{ type: "text" as const, text: "Error: 'query' is required." }],
-                            isError: true,
-                        };
+                        return errorText("Error: 'query' is required.");
+                    }
+
+                    if (
+                        tokenBudget !== undefined &&
+                        (!Number.isInteger(tokenBudget) || tokenBudget <= 0)
+                    ) {
+                        return errorText("Error: 'token_budget' must be a positive integer.");
                     }
 
                     const vectorFilters = filters
@@ -412,24 +456,33 @@ SHOWS: Tier counts, token estimates, knowledge graph size, vector store count, a
 
 
                 case "memory_compress": {
-                    const scope = (args?.scope || "working") as CompressScope;
+                    const rawScope = args?.scope || "working";
+                    if (!isCompressScope(rawScope)) {
+                        return errorText(
+                            `Error: 'scope' must be one of: ${COMPRESS_SCOPES.join(", ")}.`
+                        );
+                    }
+                    const scope = rawScope;
                     const result = await compressMemory(scope);
                     return { content: [{ type: "text" as const, text: result }] };
                 }
 
                 case "memory_forget": {
                     const memoryId = args?.memory_id as string;
-                    const action = (args?.action || "deprecate") as ForgetAction;
+                    const rawAction = args?.action || "deprecate";
                     const correction = args?.correction as string | undefined;
 
                     if (!memoryId) {
-                        return {
-                            content: [{ type: "text" as const, text: "Error: 'memory_id' is required." }],
-                            isError: true,
-                        };
+                        return errorText("Error: 'memory_id' is required.");
                     }
 
-                    const result = await forgetMemory(memoryId, action, correction);
+                    if (!isForgetAction(rawAction)) {
+                        return errorText(
+                            `Error: 'action' must be one of: ${FORGET_ACTIONS.join(", ")}.`
+                        );
+                    }
+
+                    const result = await forgetMemory(memoryId, rawAction, correction);
                     return { content: [{ type: "text" as const, text: result }] };
                 }
 

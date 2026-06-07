@@ -8,19 +8,6 @@ dist/
 data/
 *.db
 
-# Archives
-*.7z
-*.zip
-*.tar.gz
-*.rar
-
-# Build output
-dist/
-
-# Runtime data
-data/
-*.db
-
 # Environment / config with secrets
 .env
 .env.*
@@ -53,3 +40,9 @@ start-hidden.cmd
 
 # Test scripts
 test-*.mjs
+
+# Archives
+*.7z
+*.zip
+*.tar.gz
+*.rar
