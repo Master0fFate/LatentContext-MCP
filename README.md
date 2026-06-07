@@ -14,6 +14,46 @@ LLM context windows are large but finite. In long conversations the assistant lo
 
 ## Quick Start
 
+### Install from npm
+
+Use the published package directly from your MCP host:
+
+```json
+{
+  "mcpServers": {
+    "latentcontext": {
+      "command": "npx",
+      "args": ["-y", "latentcontext-mcp@latest"]
+    }
+  }
+}
+```
+
+Or install it globally:
+
+```bash
+npm install -g latentcontext-mcp
+```
+
+Then configure your MCP host:
+
+```json
+{
+  "mcpServers": {
+    "latentcontext": {
+      "command": "latentcontext-mcp",
+      "args": []
+    }
+  }
+}
+```
+
+Restart the MCP host after saving. The server communicates over stdin/stdout using the MCP JSON-RPC protocol.
+
+**Requirements:** Node.js 18+. No API keys needed — everything runs locally.
+
+### Install from source
+
 ```bash
 # Clone and install
 git clone https://github.com/Master0fFate/LatentContext-MCP.git
@@ -27,11 +67,9 @@ npm run build
 npm start
 ```
 
-**Requirements:** Node.js 18+. No API keys needed — everything runs locally.
-
 ## MCP Host Configuration
 
-Add to your MCP host settings (Claude Desktop, Cursor, Antigravity, etc.):
+For npm installs, prefer one of the configurations in Quick Start. For a local source checkout, use an absolute path to the built entry point:
 
 ```json
 {

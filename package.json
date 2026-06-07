@@ -1,9 +1,15 @@
 {
     "name": "latentcontext-mcp",
-    "version": "1.1.0",
+    "version": "1.1.1",
     "description": "LatentContext MCP Server — Intelligent memory and context management for LLMs",
     "type": "module",
     "main": "dist/index.js",
+    "types": "dist/index.d.ts",
+    "files": [
+        "dist",
+        "README.md",
+        "LICENSE"
+    ],
     "bin": {
         "latentcontext-mcp": "dist/index.js"
     },
@@ -11,7 +17,23 @@
         "build": "tsc",
         "start": "node dist/index.js",
         "dev": "tsx src/index.ts",
-        "test": "node --import tsx --test tests/*.test.ts"
+        "test": "node --import tsx --test tests/*.test.ts",
+        "prepack": "npm run build",
+        "prepublishOnly": "npm test && npm audit --audit-level=moderate"
+    },
+    "engines": {
+        "node": ">=18"
+    },
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/Master0fFate/LatentContext-MCP.git"
+    },
+    "bugs": {
+        "url": "https://github.com/Master0fFate/LatentContext-MCP/issues"
+    },
+    "homepage": "https://github.com/Master0fFate/LatentContext-MCP#readme",
+    "publishConfig": {
+        "access": "public"
     },
     "keywords": [
         "mcp",
