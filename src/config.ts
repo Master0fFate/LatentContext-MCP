@@ -1,6 +1,5 @@
 import { readFileSync, existsSync } from "fs";
 import { basename, dirname, isAbsolute, join, resolve } from "path";
-import { homedir } from "os";
 import { fileURLToPath } from "url";
 
 // ---------------------------------------------------------------------------
@@ -61,7 +60,7 @@ export const DATA_DIR_ENV = "LATENTCONTEXT_DATA_DIR";
 export const CONFIG_PATH_ENV = "LATENTCONTEXT_CONFIG";
 export const ALLOW_PROJECT_CONFIG_ENV = "LATENTCONTEXT_ALLOW_PROJECT_CONFIG";
 
-const APP_DIR_NAME = "LatentContext-MCP";
+const PROJECT_DATA_DIR_NAME = ".latentcontext";
 
 // ---------------------------------------------------------------------------
 // Defaults
@@ -121,29 +120,13 @@ function envFlagEnabled(value: string | undefined): boolean {
     return value === "1" || value?.toLowerCase() === "true";
 }
 
-export function getDefaultDataDir(
-    env: NodeJS.ProcessEnv = process.env,
-    homeDir: string = homedir(),
-    platform: NodeJS.Platform = process.platform
-): string {
+export function getDefaultDataDir(env: NodeJS.ProcessEnv = process.env): string {
     const explicit = env[DATA_DIR_ENV]?.trim();
     if (explicit) {
         return resolvePath(explicit);
     }
 
-    if (platform === "win32") {
-        const localAppData = env.LOCALAPPDATA || env.APPDATA;
-        return localAppData
-            ? join(localAppData, APP_DIR_NAME)
-            : join(homeDir, "AppData", "Local", APP_DIR_NAME);
-    }
-
-    if (platform === "darwin") {
-        return join(homeDir, "Library", "Application Support", APP_DIR_NAME);
-    }
-
-    const stateHome = env.XDG_STATE_HOME || join(homeDir, ".local", "state");
-    return join(stateHome, "latentcontext-mcp");
+    return join(process.cwd(), PROJECT_DATA_DIR_NAME);
 }
 
 function getConfigSearchPaths(configPath: string | undefined, defaultDataDir: string): string[] {
@@ -226,7 +209,7 @@ export function loadConfig(configPath?: string): LatentContextConfig {
     }
 
     const merged = deepMerge(
-        DEFAULT_CONFIG as unknown as Record<string, unknown>,
+        structuredClone(DEFAULT_CONFIG) as unknown as Record<string, unknown>,
         userConfig
     ) as unknown as LatentContextConfig;
 

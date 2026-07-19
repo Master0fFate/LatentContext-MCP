@@ -10,6 +10,7 @@ import {
     deleteSummary,
     getSummaryCountByTier,
     getTotalSummaryTokens,
+    withDatabaseTransaction,
     type SummaryRow,
 } from "./database.js";
 import {
@@ -22,9 +23,11 @@ import {
     serializeFacts,
 } from "./knowledge-graph.js";
 import {
-    addToVectorStore,
+    prepareVector,
+    persistPreparedVector,
     removeVectorsBySource,
     getVectorStoreCount,
+    type PreparedVector,
 } from "./vector-store.js";
 import { countTokens, truncateToTokenBudget } from "./token-counter.js";
 import { getCurrentSessionIdOrNull } from "./session.js";
@@ -64,12 +67,14 @@ export interface MemoryStatus {
 // Working memory (Tier 0) — in-memory ring buffer of recent turns
 // ---------------------------------------------------------------------------
 
-interface WorkingMemoryEntry {
+export interface WorkingMemoryEntry {
     id: string;
     content: string;
     tokens: number;
     timestamp: string;
     sessionId: string | null;
+    memoryType: "event";
+    confidence: number;
 }
 
 const _workingMemory: WorkingMemoryEntry[] = [];
@@ -85,30 +90,81 @@ function getSessionWorkingMemoryTokens(sessionId: string | null): number {
         .reduce((sum, entry) => sum + entry.tokens, 0);
 }
 
-function addToWorkingMemory(content: string): string {
-    const id = uuidv4();
-    const tokens = countTokens(content);
-    const sessionId = getCurrentSessionIdOrNull();
+function addToWorkingMemory(id: string, content: string, confidence: number, sessionId: string | null): void {
     _workingMemory.push({
         id,
         content,
-        tokens,
+        tokens: countTokens(content),
         timestamp: new Date().toISOString(),
         sessionId,
+        memoryType: "event",
+        confidence,
     });
-    return id;
+}
+
+/** Persist related summary/vector rows in the same durable SQLite checkpoint. */
+function persistSummaryAndVector(
+    summary: Omit<SummaryRow, "created_at" | "updated_at">,
+    vector: PreparedVector
+): string {
+    withDatabaseTransaction(() => {
+        insertSummary(summary);
+        persistPreparedVector(vector);
+    });
+    return vector.id;
+}
+
+function parseSummaryMetadata(metadata: string): Record<string, unknown> {
+    try {
+        const parsed: unknown = JSON.parse(metadata);
+        return parsed && typeof parsed === "object" ? parsed as Record<string, unknown> : {};
+    } catch {
+        return {};
+    }
+}
+
+function summaryVectorType(summary: SummaryRow): string {
+    if (summary.tier === 0) return "event";
+    if (summary.tier === 3) return "core";
+    const type = parseSummaryMetadata(summary.metadata).type;
+    return type === "fact" || type === "preference" || type === "event" || type === "core"
+        ? type
+        : "summary";
+}
+
+function summaryVectorConfidence(summary: SummaryRow): number {
+    const confidence = parseSummaryMetadata(summary.metadata).confidence;
+    return typeof confidence === "number" && confidence >= 0 && confidence <= 1 ? confidence : 0.9;
+}
+
+function summaryVectorMetadata(summary: SummaryRow, confidence: number): Record<string, unknown> {
+    const metadata = parseSummaryMetadata(summary.metadata);
+    return {
+        memoryType: summaryVectorType(summary),
+        entities: Array.isArray(metadata.entities) ? metadata.entities : [],
+        sessionId: summary.session_id,
+        confidence,
+    };
 }
 
 /**
  * Get the current session's working memory as text.
  */
 export function getWorkingMemory(): string {
+    return getCurrentSessionWorkingMemoryEntries().map((entry) => entry.content).join("\n");
+}
+
+/**
+ * Return individual Tier 0 entries for the active session only. Returning an
+ * empty list without a session is deliberate: unscoped working memory must
+ * never become retrievable after a session has ended.
+ */
+export function getCurrentSessionWorkingMemoryEntries(): WorkingMemoryEntry[] {
     const sessionId = getCurrentSessionIdOrNull();
-    const entries = sessionId
-        ? _workingMemory.filter((e) => e.sessionId === sessionId)
-        : _workingMemory;
-    if (entries.length === 0) return "";
-    return entries.map((e) => e.content).join("\n");
+    if (!sessionId) return [];
+    return _workingMemory
+        .filter((entry) => entry.sessionId === sessionId)
+        .map((entry) => ({ ...entry }));
 }
 
 /**
@@ -123,9 +179,7 @@ export function getAllWorkingMemory(): string {
  * Get working memory entries count for the current session.
  */
 export function getWorkingMemoryCount(): number {
-    const sessionId = getCurrentSessionIdOrNull();
-    if (!sessionId) return _workingMemory.length;
-    return _workingMemory.filter((e) => e.sessionId === sessionId).length;
+    return getCurrentSessionWorkingMemoryEntries().length;
 }
 
 /**
@@ -143,12 +197,13 @@ export function clearWorkingMemory(): void {
 export async function archiveWorkingMemory(sessionId: string): Promise<string | null> {
     const config = getConfig();
 
-    // Get entries for this session only
-    const sessionEntries = _workingMemory.filter((e) => e.sessionId === sessionId);
+    // Tier 0 rows are the canonical checkpoint. The in-memory array is only
+    // a retrieval cache and may be empty after a process recovery.
+    const sessionEntries = getSummariesByTierAndSession(0, sessionId);
     if (sessionEntries.length === 0) return null;
 
-    const combinedContent = sessionEntries.map((e) => e.content).join("\n");
-    const originalTokens = sessionEntries.reduce((s, e) => s + e.tokens, 0);
+    const combinedContent = sessionEntries.map((entry) => entry.content).join("\n");
+    const originalTokens = sessionEntries.reduce((sum, entry) => sum + entry.token_count, 0);
 
     const { text: compressed } = truncateToTokenBudget(
         combinedContent,
@@ -158,34 +213,37 @@ export async function archiveWorkingMemory(sessionId: string): Promise<string | 
     const summaryId = uuidv4();
     const compressedTokens = countTokens(compressed);
 
-    insertSummary({
-        id: summaryId,
-        tier: 1,
-        content: compressed,
-        token_count: compressedTokens,
-        session_id: sessionId,
-        source_ids: JSON.stringify(sessionEntries.map((e) => e.id)),
-        metadata: JSON.stringify({
-            type: "session_archive",
-            originalCount: sessionEntries.length,
-            originalTokens,
-            sessionId,
-        }),
+    // Embedding is deliberately outside the transaction; all related rows
+    // are then committed together, so a failed archive leaves Tier 0 intact.
+    const archiveVector = await prepareVector(compressed, summaryId, "summary", 0.9, {
+        sessionArchive: true,
+        sessionId,
+    });
+    withDatabaseTransaction(() => {
+        insertSummary({
+            id: summaryId,
+            tier: 1,
+            content: compressed,
+            token_count: compressedTokens,
+            session_id: sessionId,
+            source_ids: JSON.stringify(sessionEntries.map((entry) => entry.id)),
+            metadata: JSON.stringify({
+                type: "session_archive",
+                originalCount: sessionEntries.length,
+                originalTokens,
+                confidence: 0.9,
+                sessionId,
+            }),
+        });
+        persistPreparedVector(archiveVector);
+        for (const entry of sessionEntries) {
+            removeVectorsBySource(entry.id);
+            deleteSummary(entry.id);
+        }
     });
 
-    // Embed the archive for vector search
-    try {
-        await addToVectorStore(compressed, summaryId, "summary", 0.9, {
-            sessionArchive: true,
-            sessionId,
-        });
-    } catch {
-        // non-fatal
-    }
-
-    // Remove archived entries from working memory
-    const archiveIds = new Set(sessionEntries.map((e) => e.id));
-    const remaining = _workingMemory.filter((e) => !archiveIds.has(e.id));
+    const archiveIds = new Set(sessionEntries.map((entry) => entry.id));
+    const remaining = _workingMemory.filter((entry) => !archiveIds.has(entry.id));
     _workingMemory.length = 0;
     _workingMemory.push(...remaining);
 
@@ -236,195 +294,136 @@ export async function storeMemory(
 
     switch (memoryType) {
         case "core": {
-            // Tier 3 — always persisted, never evicted
             const summaryId = uuidv4();
             const tokens = countTokens(content);
-            insertSummary({
+            const vector = await prepareVector(content, summaryId, "core", confidence, {
+                memoryType: "core", entities, sessionId,
+            });
+            result.vectorId = persistSummaryAndVector({
                 id: summaryId,
                 tier: 3,
                 content,
                 token_count: tokens,
                 session_id: sessionId,
                 source_ids: "[]",
-                metadata: JSON.stringify({ type: "core", entities, sessionId }),
-            });
+                metadata: JSON.stringify({ type: "core", entities, confidence, sessionId }),
+            }, vector);
             result.memoryId = summaryId;
             result.tier = 3;
-
-            // Also embed for vector search
-            try {
-                result.vectorId = await addToVectorStore(
-                    content,
-                    summaryId,
-                    "core",
-                    confidence,
-                    { memoryType: "core", entities, sessionId }
-                );
-            } catch {
-                // Embedding failure is non-fatal
-            }
             break;
         }
 
         case "fact": {
-            // Store as knowledge graph triples + vector embed
             const factId = uuidv4();
-
-            // Ensure entities exist in the graph
-            for (const entityLabel of entities) {
-                ensureEntity(entityLabel, "unknown", {}, confidence);
-                result.entitiesCreated.push(entityLabel);
-            }
-
-            // If we have at least 2 entities, create relations between them
-            if (entities.length >= 2) {
-                // Simple heuristic: first entity is subject, infer predicate from content
-                const predicate = inferPredicate(content, entities);
-                for (let i = 1; i < entities.length; i++) {
-                    storeFact(
-                        entities[0],
-                        predicate,
-                        entities[i],
-                        "unknown",
-                        "unknown",
-                        confidence
-                    );
-                    result.factsStored++;
-                }
-            }
-
-            // Also store as Tier 1 summary for retrieval
             const tokens = countTokens(content);
-            insertSummary({
-                id: factId,
-                tier: 1,
-                content,
-                token_count: tokens,
-                session_id: sessionId,
-                source_ids: JSON.stringify(entities),
-                metadata: JSON.stringify({
-                    type: "fact",
-                    entities,
-                    confidence,
-                    sessionId,
-                }),
+            const vector = await prepareVector(content, factId, "fact", confidence, {
+                memoryType: "fact", entities, sessionId,
             });
-
-            // Embed for vector search
-            try {
-                result.vectorId = await addToVectorStore(
+            withDatabaseTransaction(() => {
+                for (const entityLabel of entities) {
+                    ensureEntity(entityLabel, "unknown", {}, confidence);
+                }
+                if (entities.length >= 2) {
+                    const predicate = inferPredicate(content, entities);
+                    for (let i = 1; i < entities.length; i++) {
+                        storeFact(entities[0], predicate, entities[i], "unknown", "unknown", confidence);
+                    }
+                }
+                insertSummary({
+                    id: factId,
+                    tier: 1,
                     content,
-                    factId,
-                    "fact",
-                    confidence,
-                    { memoryType: "fact", entities, sessionId }
-                );
-            } catch {
-                // Embedding failure is non-fatal
-            }
-
+                    token_count: tokens,
+                    session_id: sessionId,
+                    source_ids: JSON.stringify(entities),
+                    metadata: JSON.stringify({ type: "fact", entities, confidence, sessionId }),
+                });
+                result.vectorId = persistPreparedVector(vector);
+            });
+            result.entitiesCreated = [...entities];
+            result.factsStored = Math.max(entities.length - 1, 0);
             result.memoryId = factId;
             result.tier = 1;
             break;
         }
 
         case "preference": {
-            // Preferences are important — store at Tier 2 and in the graph
             const prefId = uuidv4();
             const tokens = countTokens(content);
-
-            // Create entity for "User" preferences
-            ensureEntity("User", "person", {}, 1.0);
-            for (const entityLabel of entities) {
-                ensureEntity(entityLabel, "unknown", {}, confidence);
-                storeFact("User", "prefers", entityLabel, "person", "unknown", confidence);
-                result.factsStored++;
-            }
-            result.entitiesCreated = ["User", ...entities];
-
-            insertSummary({
-                id: prefId,
-                tier: 2,
-                content,
-                token_count: tokens,
-                session_id: sessionId,
-                source_ids: JSON.stringify(entities),
-                metadata: JSON.stringify({ type: "preference", entities, sessionId }),
+            const vector = await prepareVector(content, prefId, "preference", confidence, {
+                memoryType: "preference", entities, sessionId,
             });
-
-            try {
-                result.vectorId = await addToVectorStore(
+            withDatabaseTransaction(() => {
+                ensureEntity("User", "person", {}, 1.0);
+                for (const entityLabel of entities) {
+                    ensureEntity(entityLabel, "unknown", {}, confidence);
+                    storeFact("User", "prefers", entityLabel, "person", "unknown", confidence);
+                }
+                insertSummary({
+                    id: prefId,
+                    tier: 2,
                     content,
-                    prefId,
-                    "preference",
-                    confidence,
-                    { memoryType: "preference", entities, sessionId }
-                );
-            } catch {
-                // non-fatal
-            }
-
+                    token_count: tokens,
+                    session_id: sessionId,
+                    source_ids: JSON.stringify(entities),
+                    metadata: JSON.stringify({ type: "preference", entities, confidence, sessionId }),
+                });
+                result.vectorId = persistPreparedVector(vector);
+            });
+            result.entitiesCreated = ["User", ...entities];
+            result.factsStored = entities.length;
             result.memoryId = prefId;
             result.tier = 2;
             break;
         }
 
         case "event": {
-            // Events go to Tier 0 working memory + vector embed
-            const eventId = addToWorkingMemory(content);
-
-            for (const entityLabel of entities) {
-                ensureEntity(entityLabel, "unknown", {}, confidence);
-                result.entitiesCreated.push(entityLabel);
-            }
-
-            try {
-                result.vectorId = await addToVectorStore(
+            // Tier 0's in-memory view is updated only after its summary and
+            // vector checkpoint commit, so cache and database never diverge.
+            const eventId = uuidv4();
+            const tokens = countTokens(content);
+            const eventVector = await prepareVector(content, eventId, "event", confidence, {
+                memoryType: "event", entities, timestamp: new Date().toISOString(), sessionId,
+            });
+            withDatabaseTransaction(() => {
+                insertSummary({
+                    id: eventId,
+                    tier: 0,
                     content,
-                    eventId,
-                    "event",
-                    confidence,
-                    { memoryType: "event", entities, timestamp: new Date().toISOString(), sessionId }
-                );
-            } catch {
-                // non-fatal
-            }
-
+                    token_count: tokens,
+                    session_id: sessionId,
+                    source_ids: JSON.stringify(entities),
+                    metadata: JSON.stringify({ type: "event", entities, confidence, sessionId }),
+                });
+                for (const entityLabel of entities) {
+                    ensureEntity(entityLabel, "unknown", {}, confidence);
+                }
+                result.vectorId = persistPreparedVector(eventVector);
+            });
+            addToWorkingMemory(eventId, content, confidence, sessionId);
+            result.entitiesCreated = [...entities];
             result.memoryId = eventId;
             result.tier = 0;
 
-            // Check if Tier 0 needs overflow compression
             await checkTier0Overflow();
             break;
         }
 
         case "summary": {
-            // Explicit summaries go to Tier 1
             const sumId = uuidv4();
             const tokens = countTokens(content);
-
-            insertSummary({
+            const vector = await prepareVector(content, sumId, "summary", confidence, {
+                memoryType: "summary", entities, sessionId,
+            });
+            result.vectorId = persistSummaryAndVector({
                 id: sumId,
                 tier: 1,
                 content,
                 token_count: tokens,
                 session_id: sessionId,
                 source_ids: JSON.stringify(entities),
-                metadata: JSON.stringify({ type: "summary", entities, sessionId }),
-            });
-
-            try {
-                result.vectorId = await addToVectorStore(
-                    content,
-                    sumId,
-                    "summary",
-                    confidence,
-                    { memoryType: "summary", entities, sessionId }
-                );
-            } catch {
-                // non-fatal
-            }
-
+                metadata: JSON.stringify({ type: "summary", entities, confidence, sessionId }),
+            }, vector);
             result.memoryId = sumId;
             result.tier = 1;
             break;
@@ -462,12 +461,6 @@ async function checkTier0Overflow(): Promise<void> {
 
     if (toCompress.length === 0) return;
 
-    // Remove compressed entries from the main array
-    const compressIds = new Set(toCompress.map((e) => e.id));
-    const remaining = _workingMemory.filter((e) => !compressIds.has(e.id));
-    _workingMemory.length = 0;
-    _workingMemory.push(...remaining);
-
     const combinedContent = toCompress.map((e) => e.content).join("\n");
 
     // Create a compressed Tier 1 summary
@@ -479,30 +472,36 @@ async function checkTier0Overflow(): Promise<void> {
     const summaryId = uuidv4();
     const tokens = countTokens(compressed);
 
-    insertSummary({
-        id: summaryId,
-        tier: 1,
-        content: compressed,
-        token_count: tokens,
-        session_id: sessionId,
-        source_ids: JSON.stringify(toCompress.map((e) => e.id)),
-        metadata: JSON.stringify({
-            type: "auto_compressed",
-            originalCount: toCompress.length,
-            originalTokens: toCompress.reduce((s, e) => s + e.tokens, 0),
-            sessionId,
-        }),
+    const compressedVector = await prepareVector(compressed, summaryId, "summary", 0.9, {
+        autoCompressed: true,
+        sessionId,
     });
-
-    // Embed the compressed summary
-    try {
-        await addToVectorStore(compressed, summaryId, "summary", 0.9, {
-            autoCompressed: true,
-            sessionId,
+    withDatabaseTransaction(() => {
+        insertSummary({
+            id: summaryId,
+            tier: 1,
+            content: compressed,
+            token_count: tokens,
+            session_id: sessionId,
+            source_ids: JSON.stringify(toCompress.map((entry) => entry.id)),
+            metadata: JSON.stringify({
+                type: "auto_compressed",
+                originalCount: toCompress.length,
+                originalTokens: toCompress.reduce((sum, entry) => sum + entry.tokens, 0),
+                confidence: 0.9,
+                sessionId,
+            }),
         });
-    } catch {
-        // non-fatal
-    }
+        persistPreparedVector(compressedVector);
+        for (const entry of toCompress) {
+            removeVectorsBySource(entry.id);
+            deleteSummary(entry.id);
+        }
+    });
+    const compressIds = new Set(toCompress.map((entry) => entry.id));
+    const remaining = _workingMemory.filter((entry) => !compressIds.has(entry.id));
+    _workingMemory.length = 0;
+    _workingMemory.push(...remaining);
 }
 
 /**
@@ -538,31 +537,32 @@ export async function compressMemory(scope: CompressScope): Promise<string> {
             const summaryId = uuidv4();
             const compressedTokens = countTokens(compressed);
 
-            insertSummary({
-                id: summaryId,
-                tier: 1,
-                content: compressed,
-                token_count: compressedTokens,
-                session_id: sessionId,
-                source_ids: JSON.stringify(sessionEntries.map((e) => e.id)),
-                metadata: JSON.stringify({
-                    type: "manual_compressed",
-                    scope: "working",
-                    originalCount,
-                    originalTokens,
-                    sessionId,
-                }),
+            const compressedVector = await prepareVector(compressed, summaryId, "summary", 0.9, { sessionId });
+            withDatabaseTransaction(() => {
+                insertSummary({
+                    id: summaryId,
+                    tier: 1,
+                    content: compressed,
+                    token_count: compressedTokens,
+                    session_id: sessionId,
+                    source_ids: JSON.stringify(sessionEntries.map((entry) => entry.id)),
+                    metadata: JSON.stringify({
+                        type: "manual_compressed",
+                        scope: "working",
+                        originalCount,
+                        originalTokens,
+                        confidence: 0.9,
+                        sessionId,
+                    }),
+                });
+                persistPreparedVector(compressedVector);
+                for (const entry of sessionEntries) {
+                    removeVectorsBySource(entry.id);
+                    deleteSummary(entry.id);
+                }
             });
-
-            try {
-                await addToVectorStore(compressed, summaryId, "summary", 0.9, { sessionId });
-            } catch {
-                // non-fatal
-            }
-
-            // Clear current session working memory
-            const compressIds = new Set(sessionEntries.map((e) => e.id));
-            const remaining = _workingMemory.filter((e) => !compressIds.has(e.id));
+            const compressIds = new Set(sessionEntries.map((entry) => entry.id));
+            const remaining = _workingMemory.filter((entry) => !compressIds.has(entry.id));
             _workingMemory.length = 0;
             _workingMemory.push(...remaining);
 
@@ -570,8 +570,11 @@ export async function compressMemory(scope: CompressScope): Promise<string> {
         }
 
         case "session": {
-            // Compress multiple Tier 1 summaries into fewer entries
-            const tier1 = getSummariesByTier(1);
+            // Session summaries are strictly scoped: consolidating a new
+            // session must never copy an archived predecessor into it.
+            const tier1 = sessionId
+                ? getSummariesByTierAndSession(1, sessionId)
+                : [];
             if (tier1.length < 2) {
                 return "Not enough Tier 1 summaries to consolidate.";
             }
@@ -589,39 +592,40 @@ export async function compressMemory(scope: CompressScope): Promise<string> {
             const summaryId = uuidv4();
             const compressedTokens = countTokens(compressed);
 
-            insertSummary({
-                id: summaryId,
-                tier: 1,
-                content: compressed,
-                token_count: compressedTokens,
-                session_id: sessionId,
-                source_ids: JSON.stringify(tier1.map((s) => s.id)),
-                metadata: JSON.stringify({
-                    type: "session_consolidated",
-                    originalCount: tier1.length,
-                    originalTokens,
-                    sessionId,
-                }),
+            const compressedVector = await prepareVector(compressed, summaryId, "summary", 0.85, { sessionId });
+            withDatabaseTransaction(() => {
+                insertSummary({
+                    id: summaryId,
+                    tier: 1,
+                    content: compressed,
+                    token_count: compressedTokens,
+                    session_id: sessionId,
+                    source_ids: JSON.stringify(tier1.map((s) => s.id)),
+                    metadata: JSON.stringify({
+                        type: "session_consolidated",
+                        originalCount: tier1.length,
+                        originalTokens,
+                        confidence: 0.85,
+                        sessionId,
+                    }),
+                });
+                persistPreparedVector(compressedVector);
+                for (const oldSummary of tier1) {
+                    removeVectorsBySource(oldSummary.id);
+                    deleteSummary(oldSummary.id);
+                }
             });
-
-            // Remove old Tier 1 summaries
-            for (const oldSummary of tier1) {
-                removeVectorsBySource(oldSummary.id);
-                deleteSummary(oldSummary.id);
-            }
-
-            try {
-                await addToVectorStore(compressed, summaryId, "summary", 0.85, { sessionId });
-            } catch {
-                // non-fatal
-            }
 
             return `Consolidated ${tier1.length} Tier 1 summaries (${originalTokens} tokens) into 1 summary (${compressedTokens} tokens). Compression ratio: ${(originalTokens / Math.max(compressedTokens, 1)).toFixed(1)}x`;
         }
 
         case "epoch": {
-            // Promote Tier 1 summaries into Tier 2 epoch summaries
-            const tier1 = getSummariesByTier(1);
+            // Epoch promotion must consume only the active session's Tier 1
+            // records. Tier 2 remains excluded from session retrieval, but
+            // mixing inputs here would still violate lifecycle isolation.
+            const tier1 = sessionId
+                ? getSummariesByTierAndSession(1, sessionId)
+                : [];
             if (tier1.length < config.compression.tier1ConsolidationCount) {
                 return `Need at least ${config.compression.tier1ConsolidationCount} Tier 1 summaries for epoch consolidation (have ${tier1.length}).`;
             }
@@ -639,32 +643,29 @@ export async function compressMemory(scope: CompressScope): Promise<string> {
             const epochId = uuidv4();
             const compressedTokens = countTokens(compressed);
 
-            insertSummary({
-                id: epochId,
-                tier: 2,
-                content: compressed,
-                token_count: compressedTokens,
-                session_id: sessionId,
-                source_ids: JSON.stringify(tier1.map((s) => s.id)),
-                metadata: JSON.stringify({
-                    type: "epoch_summary",
-                    originalCount: tier1.length,
-                    originalTokens,
-                    sessionId,
-                }),
+            const epochVector = await prepareVector(compressed, epochId, "epoch", 0.8, { sessionId });
+            withDatabaseTransaction(() => {
+                insertSummary({
+                    id: epochId,
+                    tier: 2,
+                    content: compressed,
+                    token_count: compressedTokens,
+                    session_id: sessionId,
+                    source_ids: JSON.stringify(tier1.map((s) => s.id)),
+                    metadata: JSON.stringify({
+                        type: "epoch_summary",
+                        originalCount: tier1.length,
+                        originalTokens,
+                        confidence: 0.8,
+                        sessionId,
+                    }),
+                });
+                persistPreparedVector(epochVector);
+                for (const oldSummary of tier1) {
+                    removeVectorsBySource(oldSummary.id);
+                    deleteSummary(oldSummary.id);
+                }
             });
-
-            // Remove promoted Tier 1 summaries
-            for (const oldSummary of tier1) {
-                removeVectorsBySource(oldSummary.id);
-                deleteSummary(oldSummary.id);
-            }
-
-            try {
-                await addToVectorStore(compressed, epochId, "epoch", 0.8, { sessionId });
-            } catch {
-                // non-fatal
-            }
 
             return `Promoted ${tier1.length} Tier 1 summaries (${originalTokens} tokens) into Tier 2 epoch summary (${compressedTokens} tokens). Compression ratio: ${(originalTokens / Math.max(compressedTokens, 1)).toFixed(1)}x`;
         }
@@ -686,53 +687,53 @@ export async function forgetMemory(
     action: ForgetAction,
     correction?: string
 ): Promise<string> {
-    // Check if it's a summary
     const summary = getSummaryById(memoryId);
-    if (summary) {
-        switch (action) {
-            case "delete":
-                removeVectorsBySource(memoryId);
-                deleteSummary(memoryId);
-                return `Deleted memory ${memoryId} (was Tier ${summary.tier} summary).`;
+    if (!summary) return `Memory ${memoryId} not found.`;
 
-            case "deprecate":
-                updateSummaryContent(
-                    memoryId,
-                    `[DEPRECATED] ${summary.content}`,
-                    summary.token_count + 15
-                );
-                return `Deprecated memory ${memoryId}.`;
-
-            case "correct":
-                if (!correction) return "Correction text required for 'correct' action.";
-                const tokens = countTokens(correction);
-                updateSummaryContent(memoryId, correction, tokens);
-                // Re-embed with new content
-                removeVectorsBySource(memoryId);
-                try {
-                    await addToVectorStore(correction, memoryId, summary.tier === 3 ? "core" : "summary", 0.9);
-                } catch {
-                    // non-fatal
-                }
-                return `Corrected memory ${memoryId} with new content.`;
-        }
+    const isWorkingMemory = summary.tier === 0;
+    const wmIdx = _workingMemory.findIndex((entry) => entry.id === memoryId);
+    if (action === "delete") {
+        withDatabaseTransaction(() => {
+            removeVectorsBySource(memoryId);
+            deleteSummary(memoryId);
+        });
+        if (wmIdx !== -1) _workingMemory.splice(wmIdx, 1);
+        return isWorkingMemory
+            ? `Deleted working memory entry ${memoryId}.`
+            : `Deleted memory ${memoryId} (was Tier ${summary.tier} summary).`;
     }
 
-    // Check if it's a working memory entry
-    const wmIdx = _workingMemory.findIndex((e) => e.id === memoryId);
+    if (action === "correct" && !correction) {
+        return "Correction text required for 'correct' action.";
+    }
+
+    const content = action === "correct" ? correction! : `[DEPRECATED] ${summary.content}`;
+    const metadata = parseSummaryMetadata(summary.metadata);
+    const confidence = action === "deprecate" ? 0.1 : summaryVectorConfidence(summary);
+    metadata.confidence = confidence;
+    const vector = await prepareVector(content, memoryId, summaryVectorType(summary), confidence, {
+        ...summaryVectorMetadata(summary, confidence),
+        memoryType: summaryVectorType(summary),
+    });
+
+    // Updating text and replacing its search index is one durable mutation.
+    // The cache is invalidated inside the transaction and reloads only after
+    // the committed database image is visible.
+    withDatabaseTransaction(() => {
+        updateSummaryContent(memoryId, content, countTokens(content), JSON.stringify(metadata));
+        removeVectorsBySource(memoryId);
+        persistPreparedVector(vector);
+    });
+
     if (wmIdx !== -1) {
-        if (action === "delete") {
-            _workingMemory.splice(wmIdx, 1);
-            return `Deleted working memory entry ${memoryId}.`;
-        }
-        if (action === "correct" && correction) {
-            _workingMemory[wmIdx].content = correction;
-            _workingMemory[wmIdx].tokens = countTokens(correction);
-            return `Corrected working memory entry ${memoryId}.`;
-        }
+        _workingMemory[wmIdx].content = content;
+        _workingMemory[wmIdx].tokens = countTokens(content);
+        _workingMemory[wmIdx].confidence = confidence;
     }
-
-    return `Memory ${memoryId} not found.`;
+    if (action === "deprecate") return `Deprecated memory ${memoryId}.`;
+    return isWorkingMemory
+        ? `Corrected working memory entry ${memoryId}.`
+        : `Corrected memory ${memoryId} with new content.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -751,9 +752,7 @@ export function getMemoryStatus(): MemoryStatus {
     }
 
     const sessionId = getCurrentSessionIdOrNull();
-    const sessionEntries = sessionId
-        ? _workingMemory.filter((e) => e.sessionId === sessionId)
-        : _workingMemory;
+    const sessionEntries = getCurrentSessionWorkingMemoryEntries();
     const tier0Tokens = sessionEntries.reduce((s, e) => s + e.tokens, 0);
     const tier1Tokens = summariesByTier[1]?.reduce((s, r) => s + r.token_count, 0) || 0;
     const tier2Tokens = summariesByTier[2]?.reduce((s, r) => s + r.token_count, 0) || 0;
@@ -788,14 +787,9 @@ export function getCoreMemory(): string {
  * Get current session working memory content.
  */
 export function getCurrentSessionMemory(): string {
-    const sessionId = getCurrentSessionIdOrNull();
-    const entries = sessionId
-        ? _workingMemory.filter((e) => e.sessionId === sessionId)
-        : _workingMemory;
+    const entries = getCurrentSessionWorkingMemoryEntries();
     if (entries.length === 0) return "No working memory entries for this session.";
-    return entries
-        .map((e) => `[${e.timestamp}] ${e.content}`)
-        .join("\n");
+    return entries.map((e) => `[${e.timestamp}] ${e.content}`).join("\n");
 }
 
 // ---------------------------------------------------------------------------

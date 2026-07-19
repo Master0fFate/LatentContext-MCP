@@ -5,6 +5,7 @@ import {
     deleteVector,
     deleteVectorsBySourceId,
     getVectorCount,
+    getDb,
     type VectorRow,
 } from "./database.js";
 import {
@@ -36,6 +37,17 @@ export interface VectorSearchFilter {
     minConfidence?: number;
 }
 
+/** An embedded vector ready to persist in a caller-controlled transaction. */
+export interface PreparedVector {
+    id: string;
+    sourceId: string;
+    sourceType: string;
+    contentPreview: string;
+    embedding: number[];
+    confidence: number;
+    metadata: Record<string, unknown>;
+}
+
 // ---------------------------------------------------------------------------
 // In-memory vector cache for fast search
 // ---------------------------------------------------------------------------
@@ -53,9 +65,13 @@ interface CachedVector {
 
 let _vectorCache: CachedVector[] | null = null;
 let _cacheStale = true;
+let _cacheDatabase: ReturnType<typeof getDb> | null = null;
 
 function loadVectorCache(): CachedVector[] {
-    if (_vectorCache && !_cacheStale) return _vectorCache;
+    const database = getDb();
+    // A database can be closed and reopened in-process during lifecycle
+    // recovery/tests. Never serve vectors decoded from the former instance.
+    if (_vectorCache && !_cacheStale && _cacheDatabase === database) return _vectorCache;
 
     const rows = getAllVectors();
     _vectorCache = rows.map((row) => ({
@@ -65,9 +81,10 @@ function loadVectorCache(): CachedVector[] {
         contentPreview: row.content_preview,
         embedding: bufferToVector(row.embedding),
         confidence: row.confidence,
-        metadata: JSON.parse(row.metadata || "{}"),
+        metadata: parseMetadata(row.metadata),
         createdAt: row.created_at,
     }));
+    _cacheDatabase = database;
     _cacheStale = false;
 
     return _vectorCache;
@@ -77,9 +94,54 @@ function invalidateCache(): void {
     _cacheStale = true;
 }
 
+function parseMetadata(metadata: string): Record<string, unknown> {
+    try {
+        const parsed: unknown = JSON.parse(metadata || "{}");
+        return parsed && typeof parsed === "object" ? parsed as Record<string, unknown> : {};
+    } catch {
+        return {};
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Vector store operations
 // ---------------------------------------------------------------------------
+
+/** Embed content without mutating storage, for atomic multi-row mutations. */
+export async function prepareVector(
+    content: string,
+    sourceId: string,
+    sourceType: string,
+    confidence: number = 1.0,
+    metadata: Record<string, unknown> = {}
+): Promise<PreparedVector> {
+    const embedding = await embed(content);
+    return {
+        id: uuidv4(),
+        sourceId,
+        sourceType,
+        contentPreview: content.length > 200 ? content.substring(0, 200) + "..." : content,
+        embedding,
+        confidence,
+        metadata,
+    };
+}
+
+/** Persist a previously prepared vector in the caller's database transaction. */
+export function persistPreparedVector(vector: PreparedVector): string {
+    insertVector({
+        id: vector.id,
+        source_id: vector.sourceId,
+        source_type: vector.sourceType,
+        content_preview: vector.contentPreview,
+        embedding: vectorToBuffer(vector.embedding),
+        dimensions: vector.embedding.length,
+        metadata: JSON.stringify(vector.metadata),
+        confidence: vector.confidence,
+    });
+    invalidateCache();
+    return vector.id;
+}
 
 /**
  * Add content to the vector store. Embeds the text and stores the vector.
@@ -91,25 +153,9 @@ export async function addToVectorStore(
     confidence: number = 1.0,
     metadata: Record<string, unknown> = {}
 ): Promise<string> {
-    const embedding = await embed(content);
-    const id = uuidv4();
-
-    const preview =
-        content.length > 200 ? content.substring(0, 200) + "..." : content;
-
-    insertVector({
-        id,
-        source_id: sourceId,
-        source_type: sourceType,
-        content_preview: preview,
-        embedding: vectorToBuffer(embedding),
-        dimensions: embedding.length,
-        metadata: JSON.stringify(metadata),
-        confidence,
-    });
-
-    invalidateCache();
-    return id;
+    return persistPreparedVector(
+        await prepareVector(content, sourceId, sourceType, confidence, metadata)
+    );
 }
 
 /**

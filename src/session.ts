@@ -3,6 +3,8 @@ import { getConfig } from "./config.js";
 import {
     insertSession,
     endSessionRecord,
+    transitionSessionRecord,
+    getActiveSession,
     getRecentSessions as dbGetRecentSessions,
     type SessionRow,
 } from "./database.js";
@@ -56,43 +58,44 @@ export async function startSession(
         archiveSummary: null,
     };
 
-    // Archive previous session if one exists
-    if (_currentSessionId) {
-        result.previousSessionId = _currentSessionId;
+    // A process can disappear before it marks its session ended. Treat that
+    // database record exactly like an in-process predecessor, rather than
+    // leaving an orphaned active lifecycle behind on the next boot.
+    const previousSessionId = _currentSessionId ?? getActiveSession()?.id ?? null;
+    if (previousSessionId) {
+        result.previousSessionId = previousSessionId;
 
-        // Call the archive callback (compresses working memory → Tier 1)
+        // Archival is part of the acknowledged transition. Do not hide an
+        // error and then clear/close the old lifecycle: its durable Tier 0
+        // checkpoint remains recoverable and the caller can retry.
         if (archiveCallback) {
-            try {
-                result.archiveSummary = await archiveCallback(_currentSessionId);
-                result.previousSessionArchived = result.archiveSummary !== null;
-            } catch {
-                // Archive failure is non-fatal — we still start the new session
-            }
+            result.archiveSummary = await archiveCallback(previousSessionId);
+            result.previousSessionArchived = result.archiveSummary !== null;
         }
-
-        // Mark old session as ended in the database
-        endSessionRecord(_currentSessionId);
     }
 
-    // Generate new session with timestamp-prefixed ID for guaranteed uniqueness.
-    // Format: {unixTimestampMs}-{uuid} — the timestamp ensures temporal uniqueness
-    // even if UUID somehow collides (which is already astronomically unlikely).
+    // Generate locally first; publish it to module state only after the
+    // database transition has reached its durable checkpoint.
     const timestamp = Date.now();
-    _currentSessionId = `${timestamp}-${uuidv4()}`;
-    _sessionStartedAt = new Date(timestamp).toISOString();
-
-    result.sessionId = _currentSessionId;
-    result.startedAt = _sessionStartedAt;
-
-    // Persist session to database
-    insertSession({
-        id: _currentSessionId,
-        started_at: _sessionStartedAt,
+    const nextSessionId = `${timestamp}-${uuidv4()}`;
+    const nextStartedAt = new Date(timestamp).toISOString();
+    const nextSession: SessionRow = {
+        id: nextSessionId,
+        started_at: nextStartedAt,
         ended_at: null,
-        metadata: JSON.stringify({
-            previousSessionId: result.previousSessionId,
-        }),
-    });
+        metadata: JSON.stringify({ previousSessionId }),
+    };
+
+    if (previousSessionId) {
+        transitionSessionRecord(previousSessionId, nextSession);
+    } else {
+        insertSession(nextSession);
+    }
+
+    _currentSessionId = nextSessionId;
+    _sessionStartedAt = nextStartedAt;
+    result.sessionId = nextSessionId;
+    result.startedAt = nextStartedAt;
 
     return result;
 }
@@ -106,6 +109,23 @@ export function endCurrentSession(): void {
         _currentSessionId = null;
         _sessionStartedAt = null;
     }
+}
+
+/**
+ * Archive the current durable Tier 0 checkpoint before ending it. This is the
+ * shutdown path; failures propagate so callers can log and surface them.
+ */
+export async function endCurrentSessionWithArchive(
+    archiveCallback: (sessionId: string) => Promise<string | null>
+): Promise<string | null> {
+    if (!_currentSessionId) return null;
+
+    const sessionId = _currentSessionId;
+    const archiveSummary = await archiveCallback(sessionId);
+    endSessionRecord(sessionId);
+    _currentSessionId = null;
+    _sessionStartedAt = null;
+    return archiveSummary;
 }
 
 /**

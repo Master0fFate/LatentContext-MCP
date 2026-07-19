@@ -7,6 +7,7 @@ import {
     ALLOW_PROJECT_CONFIG_ENV,
     CONFIG_PATH_ENV,
     DATA_DIR_ENV,
+    getConfigSource,
     getDefaultDataDir,
     loadConfig,
     resetConfig,
@@ -49,33 +50,65 @@ afterEach(() => {
     }
 });
 
-test("default data dir uses platform app storage on Windows", () => {
-    const dataDir = getDefaultDataDir(
-        { LOCALAPPDATA: "C:\\Users\\Ada\\AppData\\Local" },
-        "C:\\Users\\Ada",
-        "win32"
-    );
-
-    assert.equal(dataDir, "C:\\Users\\Ada\\AppData\\Local\\LatentContext-MCP");
-});
-
-test("default config does not resolve storage under the launched project cwd", () => {
+test("default config stores data in the launched project's .latentcontext directory", () => {
     clearConfigEnv();
     const projectDir = tempDir();
     process.chdir(projectDir);
 
-    const config = loadConfig();
-
-    assert.notEqual(config.storage.dataDir, join(projectDir, "data"));
+    assert.equal(getDefaultDataDir(), join(projectDir, ".latentcontext"));
+    assert.equal(loadConfig().storage.dataDir, join(projectDir, ".latentcontext"));
 });
 
-test("LATENTCONTEXT_DATA_DIR overrides the default storage directory", () => {
+test("different project roots use different default storage directories", () => {
     clearConfigEnv();
+    const firstProjectDir = tempDir();
+    const secondProjectDir = tempDir();
+
+    process.chdir(firstProjectDir);
+    const firstDataDir = loadConfig().storage.dataDir;
+
+    resetConfig();
+    process.chdir(secondProjectDir);
+    const secondDataDir = loadConfig().storage.dataDir;
+
+    assert.equal(firstDataDir, join(firstProjectDir, ".latentcontext"));
+    assert.equal(secondDataDir, join(secondProjectDir, ".latentcontext"));
+    assert.notEqual(firstDataDir, secondDataDir);
+});
+
+test("LATENTCONTEXT_DATA_DIR overrides configured and project-local storage", () => {
+    clearConfigEnv();
+    const projectDir = tempDir();
+    const configDir = tempDir();
     const dataDir = tempDir();
+    const configPath = join(configDir, "latentcontext.config.json");
+    writeFileSync(configPath, JSON.stringify({ storage: { dataDir: "./configured-data" } }));
+    process.chdir(projectDir);
+    process.env[DATA_DIR_ENV] = dataDir;
+
+    const config = loadConfig(configPath);
+
+    assert.equal(config.storage.dataDir, resolve(dataDir));
+});
+
+test("environment-selected config loads while LATENTCONTEXT_DATA_DIR takes precedence", () => {
+    clearConfigEnv();
+    const projectDir = tempDir();
+    const configDir = tempDir();
+    const dataDir = tempDir();
+    const configPath = join(configDir, "latentcontext.config.json");
+    writeFileSync(
+        configPath,
+        JSON.stringify({ storage: { dataDir: "./configured-data", sqliteFile: "from-env-config.db" } })
+    );
+    process.chdir(projectDir);
+    process.env[CONFIG_PATH_ENV] = configPath;
     process.env[DATA_DIR_ENV] = dataDir;
 
     const config = loadConfig();
 
+    assert.equal(getConfigSource(), resolve(configPath));
+    assert.equal(config.storage.sqliteFile, "from-env-config.db");
     assert.equal(config.storage.dataDir, resolve(dataDir));
 });
 

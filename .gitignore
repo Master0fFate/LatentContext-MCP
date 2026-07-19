@@ -4,9 +4,8 @@ node_modules/
 # Build output
 dist/
 
-# Runtime data
-data/
-*.db
+# Project-local runtime state
+/.latentcontext/
 
 # Environment / config with secrets
 .env

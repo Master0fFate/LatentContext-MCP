@@ -4,7 +4,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { loadConfig } from "./config.js";
 import { initDatabase, closeDatabase } from "./database.js";
 import { createServer } from "./server.js";
-import { startSession, endCurrentSession } from "./session.js";
+import { startSession, endCurrentSessionWithArchive } from "./session.js";
+import { archiveWorkingMemory } from "./memory-manager.js";
 import { writeFileSync, appendFileSync, mkdirSync, existsSync } from "fs";
 import { join } from "path";
 import { spawn } from "child_process";
@@ -155,7 +156,7 @@ async function main(): Promise<void> {
     // Step 5: Auto-start a fresh session on server startup
     if (config.session.autoStartOnBoot) {
         try {
-            await startSession();
+            await startSession(archiveWorkingMemory);
             logToFile("INFO", "Auto-started initial session");
         } catch (error) {
             logToFile("ERROR", "Failed to auto-start session (non-fatal)", error);
@@ -179,39 +180,48 @@ async function main(): Promise<void> {
     const shutdown = async (signal: string) => {
         if (isShuttingDown) return; // Prevent double-shutdown
         isShuttingDown = true;
+        let shutdownFailed = false;
         logToFile("INFO", `Shutdown requested (${signal})`);
 
         try {
-            endCurrentSession();
-            logToFile("INFO", "Session ended");
+            await endCurrentSessionWithArchive(archiveWorkingMemory);
+            logToFile("INFO", "Session archived and ended");
         } catch (error) {
-            logToFile("ERROR", "Error ending session", error);
+            shutdownFailed = true;
+            // The database checkpoint is intentionally retained for recovery
+            // on the next boot; never claim a failed lifecycle transition ended.
+            logToFile("ERROR", "Error archiving and ending session", error);
         }
 
         try {
             closeDatabase();
             logToFile("INFO", "Database closed");
         } catch (error) {
-            logToFile("ERROR", "Error closing database", error);
+            shutdownFailed = true;
+            logToFile("ERROR", "Error flushing/closing database", error);
         }
 
         try {
             await server.close();
             logToFile("INFO", "MCP server closed");
         } catch (error) {
+            shutdownFailed = true;
             logToFile("ERROR", "Error closing MCP server", error);
         }
 
-        // Exit cleanly after all resources are released
-        // Use a small delay to allow final writes to flush
+        // Exit only after lifecycle/database errors have been recorded. A
+        // non-zero status makes shutdown failures observable to the host.
         setTimeout(() => {
-            process.exit(0);
+            process.exit(shutdownFailed ? 1 : 0);
         }, 200);
     };
 
     process.on("SIGINT", () => shutdown("SIGINT"));
     process.on("SIGTERM", () => shutdown("SIGTERM"));
     process.on("SIGHUP", () => shutdown("SIGHUP"));
+    // MCP stdio hosts commonly signal normal teardown by closing stdin rather
+    // than sending a POSIX signal. Treat it as the same lifecycle checkpoint.
+    process.stdin.once("end", () => { void shutdown("stdin closed"); });
 
     // Step 8: Handle uncaught errors — log but do NOT crash
     process.on("uncaughtException", (error: Error) => {

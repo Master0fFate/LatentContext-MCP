@@ -1,6 +1,6 @@
 {
     "name": "latentcontext-mcp",
-    "version": "1.1.1",
+    "version": "1.2.0",
     "description": "LatentContext MCP Server — Intelligent memory and context management for LLMs",
     "type": "module",
     "main": "dist/index.js",
@@ -14,12 +14,15 @@
         "latentcontext-mcp": "dist/index.js"
     },
     "scripts": {
-        "build": "tsc",
+        "build": "tsc && node scripts/make-bin-executable.mjs",
         "start": "node dist/index.js",
         "dev": "tsx src/index.ts",
         "test": "node --import tsx --test tests/*.test.ts",
+        "test:smoke": "node --import tsx --test tests/package-smoke.test.ts",
+        "audit:production": "npm audit --omit=dev --audit-level=moderate",
+        "benchmark:retrieval": "node --import tsx benchmarks/retrieval.bench.ts",
         "prepack": "npm run build",
-        "prepublishOnly": "npm test && npm audit --audit-level=moderate"
+        "prepublishOnly": "npm test && npm audit --audit-level=low"
     },
     "engines": {
         "node": ">=18"
@@ -55,7 +58,7 @@
     "devDependencies": {
         "@types/node": "^22.13.0",
         "@types/uuid": "^10.0.0",
-        "tsx": "^4.19.0",
+        "tsx": "^4.23.1",
         "typescript": "^5.7.0"
     }
 }

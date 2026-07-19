@@ -1,33 +1,40 @@
-import { getConfig } from "./config.js";
 import {
-    getSummariesByTier,
     getSummariesByTierAndSession,
-    getSummariesByTierExcludingSession,
     logAccess,
-    getAccessFrequency,
 } from "./database.js";
-import { queryEntity, serializeFacts, getAllFacts } from "./knowledge-graph.js";
-import { searchVectors, type VectorSearchResult, type VectorSearchFilter } from "./vector-store.js";
 import { countTokens, truncateToTokenBudget } from "./token-counter.js";
-import { cosineSimilarity } from "./embeddings.js";
-import { getCoreMemory, getWorkingMemory } from "./memory-manager.js";
-import { getCurrentSessionIdOrNull, getSessionStartTime } from "./session.js";
+import {
+    getCurrentSessionWorkingMemoryEntries,
+    type WorkingMemoryEntry,
+} from "./memory-manager.js";
+import { getConfig } from "./config.js";
+import { getCurrentSessionIdOrNull } from "./session.js";
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
+// Filters intentionally use the vector-store spelling internally so existing
+// callers remain compatible. In retrieval they apply to memory types, not the
+// global vector store (which is deliberately excluded for session isolation).
+export interface RetrievalFilters {
+    sourceTypes?: string[];
+    after?: string;
+    before?: string;
+    minConfidence?: number;
+}
+
+const SUPPORTED_MEMORY_TYPES = new Set(["fact", "preference", "event", "summary", "core"]);
+type MemoryTypeName = "fact" | "preference" | "event" | "summary" | "core";
 
 interface ContextCandidate {
     id: string;
     content: string;
-    tokens: number;
-    score: number;
-    source: string; // 'core' | 'working' | 'vector' | 'graph' | 'current_session' | 'past_sessions' | 'long_term'
+    source: "working" | "current_session";
+    memoryType: MemoryTypeName;
+    confidence: number;
     similarity: number;
-    recency: number;
     priority: number;
-    frequency: number;
     createdAt: string;
+    tokenCount: number;
+    /** Cached once per candidate: deduplication compares these sets repeatedly. */
+    termSet: ReadonlySet<string>;
 }
 
 export interface AssembledContext {
@@ -41,285 +48,359 @@ export interface AssembledContext {
     sessionId: string | null;
 }
 
-// ---------------------------------------------------------------------------
-// Recency scoring
-// ---------------------------------------------------------------------------
-
-function recencyScore(createdAt: string): number {
-    const now = Date.now();
-    const created = new Date(createdAt).getTime();
-    const ageHours = (now - created) / (1000 * 60 * 60);
-
-    // Exponential decay: score = e^(-ageHours / 168)
-    // Half-life of ~1 week (168 hours)
-    return Math.exp(-ageHours / 168);
+function sourcePriority(source: ContextCandidate["source"]): number {
+    return source === "working" ? 0.95 : 0.9;
 }
 
-// ---------------------------------------------------------------------------
-// Source priority scoring
-// ---------------------------------------------------------------------------
+/** Tokenize locally so retrieval remains fast, deterministic, and model-free. */
+function terms(text: string): Set<string> {
+    return new Set(
+        text
+            .toLocaleLowerCase()
+            .match(/[\p{L}\p{N}_-]+/gu)
+            ?.filter((term) => term.length > 1) ?? []
+    );
+}
 
-function sourcePriority(source: string): number {
-    switch (source) {
-        case "core":
-            return 1.0;
-        case "working":
-            return 0.95;
-        case "current_session":
-            return 0.9;
-        case "graph":
-            return 0.8;
-        case "long_term":
-            return 0.65;
-        case "past_sessions":
-            return 0.5;
-        case "vector":
-            return 0.4;
-        default:
-            return 0.3;
+/**
+ * Query coverage is a deterministic lexical relevance signal. It avoids an
+ * embedding request (and therefore a model download) on every retrieval.
+ */
+function querySimilarity(queryTerms: ReadonlySet<string>, contentTerms: ReadonlySet<string>): number {
+    if (queryTerms.size === 0) return 0;
+
+    let matches = 0;
+    for (const term of queryTerms) {
+        if (contentTerms.has(term)) matches++;
+    }
+    return matches / queryTerms.size;
+}
+
+function indexTerms(index: number, termSet: ReadonlySet<string>, indexesByTerm: Map<string, Set<number>>): void {
+    for (const term of termSet) {
+        let indexes = indexesByTerm.get(term);
+        if (!indexes) {
+            indexes = new Set();
+            indexesByTerm.set(term, indexes);
+        }
+        indexes.add(index);
     }
 }
 
-// ---------------------------------------------------------------------------
-// Deduplication
-// ---------------------------------------------------------------------------
+function unindexTerms(index: number, termSet: ReadonlySet<string>, indexesByTerm: Map<string, Set<number>>): void {
+    for (const term of termSet) {
+        const indexes = indexesByTerm.get(term);
+        if (!indexes) continue;
+        indexes.delete(index);
+        if (indexes.size === 0) indexesByTerm.delete(term);
+    }
+}
 
+/**
+ * Preserve first-match deduplication while avoiding comparisons between
+ * candidates that share no term. Term sets are built once, rather than once
+ * for every candidate pair.
+ */
 function deduplicate(candidates: ContextCandidate[], threshold: number): ContextCandidate[] {
     const result: ContextCandidate[] = [];
+    const indexesByTerm = new Map<string, Set<number>>();
 
     for (const candidate of candidates) {
-        let isDuplicate = false;
+        // At a zero threshold even disjoint (or empty) term sets are duplicates.
+        // Keep that configurable edge case identical to the original scan.
+        if (threshold <= 0 && result.length > 0) {
+            if (compareCandidates(candidate, result[0]) < 0) {
+                unindexTerms(0, result[0].termSet, indexesByTerm);
+                result[0] = candidate;
+                indexTerms(0, candidate.termSet, indexesByTerm);
+            }
+            continue;
+        }
 
-        for (const existing of result) {
-            // Simple text-based similarity check using character overlap
-            const similarity = textSimilarity(candidate.content, existing.content);
-            if (similarity >= threshold) {
-                // Keep the one with higher score
-                if (candidate.score > existing.score) {
-                    const idx = result.indexOf(existing);
-                    result[idx] = candidate;
-                }
-                isDuplicate = true;
-                break;
+        // Count intersections directly from the inverted index. This avoids
+        // sorting candidate indexes and re-scanning candidate terms for every
+        // possible pair; a pair is evaluated only when it shares a term.
+        const intersectionsByIndex = new Map<number, number>();
+        for (const term of candidate.termSet) {
+            for (const index of indexesByTerm.get(term) ?? []) {
+                intersectionsByIndex.set(index, (intersectionsByIndex.get(index) ?? 0) + 1);
             }
         }
 
-        if (!isDuplicate) {
+        let duplicateIndex: number | undefined;
+        for (const [index, intersection] of intersectionsByIndex) {
+            const existing = result[index];
+            const similarity = intersection / (candidate.termSet.size + existing.termSet.size - intersection);
+            if (similarity >= threshold && (duplicateIndex === undefined || index < duplicateIndex)) {
+                // The prior linear scan used the first duplicate, not the
+                // highest-scoring one, so retain that observable behavior.
+                duplicateIndex = index;
+            }
+        }
+
+        if (duplicateIndex === undefined) {
+            const index = result.length;
             result.push(candidate);
+            indexTerms(index, candidate.termSet, indexesByTerm);
+        } else if (compareCandidates(candidate, result[duplicateIndex]) < 0) {
+            unindexTerms(duplicateIndex, result[duplicateIndex].termSet, indexesByTerm);
+            result[duplicateIndex] = candidate;
+            indexTerms(duplicateIndex, candidate.termSet, indexesByTerm);
         }
     }
-
     return result;
 }
 
-/**
- * Simple Jaccard-like text similarity based on word overlap.
- * Fast approximation — no embeddings needed.
- */
-function textSimilarity(a: string, b: string): number {
-    const wordsA = new Set(a.toLowerCase().split(/\s+/).filter((w) => w.length > 2));
-    const wordsB = new Set(b.toLowerCase().split(/\s+/).filter((w) => w.length > 2));
+/** Higher query relevance always wins; remaining criteria break ties predictably. */
+function compareCandidates(a: ContextCandidate, b: ContextCandidate): number {
+    return (
+        b.similarity - a.similarity ||
+        b.createdAt.localeCompare(a.createdAt) ||
+        b.priority - a.priority ||
+        a.id.localeCompare(b.id)
+    );
+}
 
-    if (wordsA.size === 0 || wordsB.size === 0) return 0;
-
-    let intersection = 0;
-    for (const word of wordsA) {
-        if (wordsB.has(word)) intersection++;
+function parseMetadata(metadata: string): Record<string, unknown> {
+    try {
+        const parsed = JSON.parse(metadata);
+        return parsed && typeof parsed === "object" ? parsed as Record<string, unknown> : {};
+    } catch {
+        return {};
     }
-
-    const union = wordsA.size + wordsB.size - intersection;
-    return union === 0 ? 0 : intersection / union;
 }
 
-// ---------------------------------------------------------------------------
-// Entity extraction (simple heuristic)
-// ---------------------------------------------------------------------------
-
-function extractEntityMentions(query: string): string[] {
-    // Extract capitalized words/phrases as potential entity mentions
-    const matches = query.match(/\b[A-Z][a-zA-Z]*(?:\s+[A-Z][a-zA-Z]*)*/g) || [];
-
-    // Also extract quoted strings
-    const quoted = query.match(/"([^"]+)"/g) || [];
-    const quotedClean = quoted.map((q) => q.replace(/"/g, ""));
-
-    const entities = [...new Set([...matches, ...quotedClean])];
-
-    // Filter out common English words that might be capitalized (sentence starts, etc.)
-    const stopWords = new Set([
-        "The", "This", "That", "What", "When", "Where", "Who", "Why", "How",
-        "I", "You", "We", "They", "He", "She", "It", "My", "Your", "Our",
-        "Can", "Could", "Would", "Should", "Do", "Does", "Did", "Is", "Are",
-        "Was", "Were", "Has", "Have", "Had", "Will", "And", "But", "Or",
-        "Not", "No", "Yes", "If", "Then", "So", "Also", "Just", "Only",
-        "About", "After", "Before", "Between", "From", "Into", "For", "With",
-    ]);
-
-    return entities.filter((e) => !stopWords.has(e) && e.length > 1);
+function summaryMemoryType(metadata: Record<string, unknown>): MemoryTypeName {
+    const type = metadata.type;
+    return typeof type === "string" && SUPPORTED_MEMORY_TYPES.has(type)
+        ? type as MemoryTypeName
+        : "summary";
 }
 
-// ---------------------------------------------------------------------------
-// Context assembly (the core algorithm)
-// ---------------------------------------------------------------------------
+function summaryConfidence(metadata: Record<string, unknown>): number {
+    const confidence = metadata.confidence;
+    return typeof confidence === "number" && confidence >= 0 && confidence <= 1
+        ? confidence
+        : 1;
+}
+
+function validateFilters(filters?: RetrievalFilters): void {
+    if (!filters) return;
+    if (filters.sourceTypes !== undefined) {
+        if (!Array.isArray(filters.sourceTypes) || filters.sourceTypes.length === 0) {
+            throw new Error("memory_types filter must be a non-empty array.");
+        }
+        for (const type of filters.sourceTypes) {
+            if (!SUPPORTED_MEMORY_TYPES.has(type)) {
+                throw new Error(`Unsupported memory type filter: ${type}`);
+            }
+        }
+    }
+    for (const [name, value] of [["after", filters.after], ["before", filters.before]] as const) {
+        if (value !== undefined && Number.isNaN(Date.parse(value))) {
+            throw new Error(`Invalid ${name} filter; use an ISO datetime.`);
+        }
+    }
+    if (filters.after && filters.before && Date.parse(filters.after) > Date.parse(filters.before)) {
+        throw new Error("after filter must not be later than before filter.");
+    }
+    if (
+        filters.minConfidence !== undefined &&
+        (!Number.isFinite(filters.minConfidence) || filters.minConfidence < 0 || filters.minConfidence > 1)
+    ) {
+        throw new Error("min_confidence filter must be a number between 0 and 1.");
+    }
+}
+
+function isEligible(candidate: ContextCandidate, filters?: RetrievalFilters): boolean {
+    if (!filters) return true;
+    if (filters.sourceTypes && !filters.sourceTypes.includes(candidate.memoryType)) return false;
+    if (filters.after && Date.parse(candidate.createdAt) < Date.parse(filters.after)) return false;
+    if (filters.before && Date.parse(candidate.createdAt) > Date.parse(filters.before)) return false;
+    if (filters.minConfidence !== undefined && candidate.confidence < filters.minConfidence) return false;
+    return true;
+}
+
+function fromWorkingEntry(entry: WorkingMemoryEntry, queryTerms: ReadonlySet<string>): ContextCandidate {
+    const termSet = terms(entry.content);
+    return {
+        id: entry.id,
+        content: entry.content,
+        source: "working",
+        memoryType: entry.memoryType,
+        confidence: entry.confidence,
+        similarity: querySimilarity(queryTerms, termSet),
+        priority: sourcePriority("working"),
+        createdAt: entry.timestamp,
+        tokenCount: entry.tokens,
+        termSet,
+    };
+}
+
+const SOURCE_ORDER = ["working", "current_session"] as const;
+const SOURCE_HEADERS = {
+    working: "[Current Session] ",
+    current_session: "[Current Session Notes] ",
+} as const;
+
+function renderFooter(sessionId: string, sourceCounts: Record<string, number>): string {
+    const sourceList = Object.entries(sourceCounts)
+        .map(([source, count]) => `${source}:${count}`)
+        .join(", ");
+    return `--- Session: ${sessionId.substring(0, 20)} | Sources: ${sourceList} ---`;
+}
+
+function renderContext(
+    selected: ContextCandidate[],
+    sessionId: string,
+    sourceCounts: Record<string, number>
+): string {
+    const sections: string[] = [];
+    for (const source of SOURCE_ORDER) {
+        const items = selected.filter((candidate) => candidate.source === source);
+        if (items.length === 0) continue;
+        sections.push(`${SOURCE_HEADERS[source]}${items.map((item) => item.content).join("\n")}`);
+    }
+    return `${sections.join("\n\n")}\n\n${renderFooter(sessionId, sourceCounts)}`;
+}
 
 /**
- * Assemble the context payload for a given query within a token budget.
- *
- * SESSION ISOLATION: This function ONLY returns data from the CURRENT session.
- * It does NOT pull from past sessions, the global knowledge graph, or the
- * global vector store. Each session starts with zero memory and the AI fills
- * it during the conversation.
- *
- * Algorithm:
- * 1. Include current session working memory (Tier 0)
- * 2. Include current session Tier 1 summaries (compressed working memory)
- * 3. Score all candidates by composite relevance
- * 4. Deduplicate
- * 5. Greedily fill budget by score
- * 6. Format output with section headers
+ * Fast packing estimate. Exact rendering is checked after packing, so this
+ * estimate can never make the returned payload exceed its token budget.
+ */
+function estimateContextTokens(
+    sessionId: string,
+    sourceCounts: Record<string, number>,
+    sourceTokenTotals: Record<ContextCandidate["source"], number>
+): number {
+    let total = 0;
+    let sections = 0;
+    for (const source of SOURCE_ORDER) {
+        const count = sourceCounts[source] ?? 0;
+        if (count === 0) continue;
+        if (sections > 0) total += countTokens("\n\n");
+        total += countTokens(SOURCE_HEADERS[source]);
+        total += sourceTokenTotals[source];
+        total += (count - 1) * countTokens("\n");
+        sections++;
+    }
+    return total + countTokens("\n\n") + countTokens(renderFooter(sessionId, sourceCounts));
+}
+
+/**
+ * Assemble only active-session context. Tier 0 entries stay separate
+ * candidates so ranking and token packing can choose each entry independently.
  */
 export async function assembleContext(
     query: string,
     tokenBudget?: number,
-    filters?: VectorSearchFilter
+    filters?: RetrievalFilters
 ): Promise<AssembledContext> {
-    const config = getConfig();
-    const budget = tokenBudget || config.tokenBudgets.defaultRetrieveBudget;
-    let remainingBudget = budget;
+    if (tokenBudget !== undefined && (!Number.isInteger(tokenBudget) || tokenBudget <= 0)) {
+        throw new Error("token budget must be a positive integer.");
+    }
+    validateFilters(filters);
 
+    const budget = tokenBudget ?? getConfig().tokenBudgets.defaultRetrieveBudget;
     const sessionId = getCurrentSessionIdOrNull();
+    const emptyText = "No memories stored in this session yet. This is a fresh session — use memory_store to save important information as you go.";
+    const emptyContext = () => truncateToTokenBudget(emptyText, budget);
+
+    // Never fall back to unscoped memory. An inactive session is always empty.
+    if (!sessionId) {
+        const { text, tokens } = emptyContext();
+        return {
+            text,
+            totalTokens: tokens,
+            budgetUsed: tokens,
+            budgetRemaining: budget - tokens,
+            sourceCounts: {},
+            candidatesConsidered: 0,
+            candidatesSelected: 0,
+            sessionId: null,
+        };
+    }
+
+    const queryTerms = terms(query);
     const candidates: ContextCandidate[] = [];
-    const sourceCounts: Record<string, number> = {};
-
-    // ── 1. Current session working memory (Tier 0) ──
-    // This is the in-memory buffer of entries stored during THIS session
-    const workingMem = getWorkingMemory();
-    if (workingMem && workingMem.length > 0) {
-        const wmTokens = countTokens(workingMem);
-        candidates.push({
-            id: "working-memory",
-            content: workingMem,
-            tokens: wmTokens,
-            score: 0,
-            source: "working",
-            similarity: 0.6,
-            recency: 1.0,
-            priority: sourcePriority("working"),
-            frequency: 1.0,
-            createdAt: new Date().toISOString(),
-        });
+    for (const entry of getCurrentSessionWorkingMemoryEntries()) {
+        const candidate = fromWorkingEntry(entry, queryTerms);
+        if (isEligible(candidate, filters)) candidates.push(candidate);
     }
 
-    // ── 2. Current session Tier 1 summaries (compressed working memory) ──
-    // These are created when working memory overflows and gets compressed
-    if (sessionId) {
-        const currentSessionSummaries = getSummariesByTierAndSession(1, sessionId);
-        for (const summary of currentSessionSummaries) {
-            const freq = getAccessFrequency(summary.id);
-            candidates.push({
-                id: summary.id,
-                content: summary.content,
-                tokens: summary.token_count,
-                score: 0,
-                source: "current_session",
-                similarity: 0.6,
-                recency: recencyScore(summary.created_at),
-                priority: sourcePriority("current_session"),
-                frequency: Math.min(freq / 10, 1.0),
-                createdAt: summary.created_at,
-            });
-        }
+    for (const summary of getSummariesByTierAndSession(1, sessionId)) {
+        const metadata = parseMetadata(summary.metadata);
+        const termSet = terms(summary.content);
+        const candidate: ContextCandidate = {
+            id: summary.id,
+            content: summary.content,
+            source: "current_session",
+            memoryType: summaryMemoryType(metadata),
+            confidence: summaryConfidence(metadata),
+            similarity: querySimilarity(queryTerms, termSet),
+            priority: sourcePriority("current_session"),
+            createdAt: summary.created_at,
+            // Tier 1 content was tokenized when persisted. Reuse that exact
+            // value for greedy packing instead of encoding every summary again.
+            // The final rendered payload remains the authoritative budget check.
+            tokenCount: summary.token_count,
+            termSet,
+        };
+        if (isEligible(candidate, filters)) candidates.push(candidate);
     }
 
-    // ── NOTE: The following sources are intentionally EXCLUDED ──
-    // - Core memory (Tier 3): Global data from past sessions → NOT included
-    // - Vector search: Global vectors from all sessions → NOT included
-    // - Knowledge graph: Global entities/relations from all sessions → NOT included
-    // - Past session summaries (Tier 1 from other sessions): NOT included
-    // - Epoch summaries (Tier 2): NOT included
-    //
-    // Each session starts COMPLETELY FRESH with zero entries. The AI fills
-    // memory during the conversation and only retrieves what was stored in
-    // THIS specific session.
-
-    // ── 3. Compute composite scores ──
-    const weights = config.ranking;
-    for (const candidate of candidates) {
-        candidate.score =
-            weights.semanticWeight * candidate.similarity +
-            weights.recencyWeight * candidate.recency +
-            weights.priorityWeight * candidate.priority +
-            weights.frequencyWeight * candidate.frequency;
-    }
-
-    // ── 4. Deduplicate ──
-    const deduped = deduplicate(candidates, weights.dedupSimilarityThreshold);
-
-    // ── 5. Sort by score and greedily fill budget ──
-    deduped.sort((a, b) => b.score - a.score);
-
+    const ranked = deduplicate(
+        candidates,
+        getConfig().ranking.dedupSimilarityThreshold
+    ).sort(compareCandidates);
     const selected: ContextCandidate[] = [];
-    for (const candidate of deduped) {
-        if (candidate.tokens <= remainingBudget) {
-            selected.push(candidate);
-            remainingBudget -= candidate.tokens;
-            sourceCounts[candidate.source] = (sourceCounts[candidate.source] || 0) + 1;
-
-            // Log access for frequency tracking
-            logAccess(candidate.id, candidate.source);
-        }
-    }
-
-    // ── 6. Format output with section headers ──
-    const sections: string[] = [];
-
-    // Group selected candidates by source
-    const bySource: Record<string, ContextCandidate[]> = {};
-    for (const s of selected) {
-        if (!bySource[s.source]) bySource[s.source] = [];
-        bySource[s.source].push(s);
-    }
-
-    // Define section order and labels — current session only
-    const sourceOrder = ["working", "current_session"];
-    const sourceLabels: Record<string, string> = {
-        working: "Current Session",
-        current_session: "Current Session Notes",
+    const sourceCounts: Record<string, number> = {};
+    const sourceTokenTotals: Record<ContextCandidate["source"], number> = {
+        working: 0,
+        current_session: 0,
     };
 
-    for (const source of sourceOrder) {
-        const items = bySource[source];
-        if (items && items.length > 0) {
-            const label = sourceLabels[source] || source;
-            const content = items.map((item) => item.content).join("\n");
-            sections.push(`[${label}] ${content}`);
+    // Counting a progressively larger rendered string for every candidate is
+    // quadratic in its total text size. Pack from cached content token counts,
+    // then verify the exact final payload before recording any access.
+    for (const candidate of ranked) {
+        const nextCounts = {
+            ...sourceCounts,
+            [candidate.source]: (sourceCounts[candidate.source] || 0) + 1,
+        };
+        const nextTokenTotals = {
+            ...sourceTokenTotals,
+            [candidate.source]: sourceTokenTotals[candidate.source] + candidate.tokenCount,
+        };
+        if (estimateContextTokens(sessionId, nextCounts, nextTokenTotals) <= budget) {
+            selected.push(candidate);
+            sourceCounts[candidate.source] = nextCounts[candidate.source];
+            sourceTokenTotals[candidate.source] = nextTokenTotals[candidate.source];
         }
     }
 
-    // Build final text
-    let finalText: string;
-
-    if (sections.length > 0) {
-        finalText = sections.join("\n\n");
-
-        // Add metadata footer
-        const sourceList = Object.entries(sourceCounts)
-            .map(([source, count]) => `${source}:${count}`)
-            .join(", ");
-        const budgetUsed = budget - remainingBudget;
-        const sessionLabel = sessionId ? sessionId.substring(0, 20) : "none";
-        finalText += `\n\n--- Session: ${sessionLabel} | Sources: ${sourceList} | Tokens: ${budgetUsed}/${budget} ---`;
-    } else {
-        finalText = "No memories stored in this session yet. This is a fresh session — use memory_store to save important information as you go.";
+    let rendered = selected.length > 0
+        ? { text: renderContext(selected, sessionId, sourceCounts), tokens: 0 }
+        : emptyContext();
+    let totalTokens = rendered.tokens || countTokens(rendered.text);
+    while (selected.length > 0 && totalTokens > budget) {
+        const removed = selected.pop()!;
+        sourceCounts[removed.source]--;
+        sourceTokenTotals[removed.source] -= removed.tokenCount;
+        if (sourceCounts[removed.source] === 0) delete sourceCounts[removed.source];
+        rendered = selected.length > 0
+            ? { text: renderContext(selected, sessionId, sourceCounts), tokens: 0 }
+            : emptyContext();
+        totalTokens = rendered.tokens || countTokens(rendered.text);
     }
-
-    const totalTokens = countTokens(finalText);
-
+    for (const candidate of selected) {
+        logAccess(candidate.id, candidate.source);
+    }
     return {
-        text: finalText,
+        text: rendered.text,
         totalTokens,
-        budgetUsed: budget - remainingBudget,
-        budgetRemaining: remainingBudget,
+        budgetUsed: totalTokens,
+        budgetRemaining: budget - totalTokens,
         sourceCounts,
         candidatesConsidered: candidates.length,
         candidatesSelected: selected.length,

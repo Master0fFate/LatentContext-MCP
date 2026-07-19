@@ -1,5 +1,5 @@
 import initSqlJs, { type Database as SqlJsDatabase } from "sql.js";
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from "fs";
 import { join, dirname } from "path";
 import { createRequire } from "module";
 import { getConfig } from "./config.js";
@@ -156,7 +156,7 @@ CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at);
 
 let _db: SqlJsDatabase | null = null;
 let _dbPath: string = "";
-let _saveTimer: ReturnType<typeof setTimeout> | null = null;
+let _transactionDepth = 0;
 
 /**
  * Initialize the database. Must be called before any operations.
@@ -210,8 +210,8 @@ export async function initDatabase(): Promise<SqlJsDatabase> {
     _db.run(SCHEMA_SQL);
     _db.run(INDEXES_SQL);
 
-    // Save to disk
-    saveDatabase();
+    // Schema creation/migration is acknowledged only after it is durable.
+    saveDatabaseSync();
 
     return _db;
 }
@@ -227,60 +227,94 @@ export function getDb(): SqlJsDatabase {
 }
 
 /**
- * Save the database to disk. Debounced to avoid excessive writes.
- */
-export function saveDatabase(): void {
-    if (!_db || !_dbPath) return;
-
-    // Cancel pending save
-    if (_saveTimer) {
-        clearTimeout(_saveTimer);
-    }
-
-    // Debounce: save after 500ms of no writes
-    _saveTimer = setTimeout(() => {
-        if (!_db || !_dbPath) return;
-        try {
-            const data = _db.export();
-            const buffer = Buffer.from(data);
-            writeFileSync(_dbPath, buffer);
-        } catch {
-            // Ignore save errors
-        }
-    }, 500);
-}
-
-/**
- * Force immediate save to disk.
+ * Persist the complete sql.js image atomically. sql.js keeps mutations in
+ * memory, so a successful tool response must not rely on a later timer to
+ * make its state durable. Write a sibling temporary file then rename it so a
+ * crash cannot leave a partially-written database at the canonical path.
  */
 export function saveDatabaseSync(): void {
     if (!_db || !_dbPath) return;
-    if (_saveTimer) {
-        clearTimeout(_saveTimer);
-        _saveTimer = null;
-    }
+    const temporaryPath = `${_dbPath}.${process.pid}.tmp`;
+    const data = _db.export();
+    writeFileSync(temporaryPath, Buffer.from(data));
+    renameSync(temporaryPath, _dbPath);
+}
+
+/**
+ * Compatibility entry point for callers that explicitly request a save.
+ * Persistence errors deliberately propagate instead of being silently lost.
+ */
+export function saveDatabase(): void {
+    if (_transactionDepth > 0) return;
+    saveDatabaseSync();
+}
+
+/**
+ * Group synchronous SQL mutations into one durable checkpoint. Nested calls
+ * share the outer transaction and only export the WASM database once.
+ */
+export function withDatabaseTransaction<T>(operation: () => T): T {
+    const db = getDb();
+    const isOuterTransaction = _transactionDepth === 0;
+    if (isOuterTransaction) db.run("BEGIN");
+    _transactionDepth++;
+
+    let result: T;
     try {
-        const data = _db.export();
-        const buffer = Buffer.from(data);
-        writeFileSync(_dbPath, buffer);
-    } catch {
-        // Ignore save errors
+        result = operation();
+    } catch (error) {
+        _transactionDepth--;
+        if (isOuterTransaction) {
+            try {
+                db.run("ROLLBACK");
+            } catch {
+                // Preserve the original mutation error.
+            }
+        }
+        throw error;
     }
+
+    _transactionDepth--;
+    if (!isOuterTransaction) return result;
+
+    let committed = false;
+    try {
+        db.run("COMMIT");
+        committed = true;
+        saveDatabaseSync();
+    } catch (error) {
+        if (!committed) {
+            try {
+                db.run("ROLLBACK");
+            } catch {
+                // Preserve the commit error.
+            }
+        }
+        // A checkpoint error after COMMIT is deliberately observable. The
+        // in-memory database stays open so closeDatabase can retry its flush.
+        throw error;
+    }
+    return result;
 }
 
 /**
  * Close the database.
  */
 export function closeDatabase(): void {
-    if (_saveTimer) {
-        clearTimeout(_saveTimer);
-        _saveTimer = null;
-    }
-    if (_db) {
+    if (!_db) return;
+
+    let saveError: unknown;
+    try {
         saveDatabaseSync();
+    } catch (error) {
+        saveError = error;
+    } finally {
         _db.close();
         _db = null;
+        _dbPath = "";
+        _transactionDepth = 0;
     }
+    if (saveError) throw saveError;
 }
 
 // ---------------------------------------------------------------------------
@@ -309,7 +343,7 @@ function queryOne<T>(sql: string, params: unknown[] = []): T | undefined {
 function runSql(sql: string, params: unknown[] = []): void {
     const db = getDb();
     db.run(sql, params);
-    saveDatabase();
+    if (_transactionDepth === 0) saveDatabaseSync();
 }
 
 function now(): string {
@@ -541,11 +575,23 @@ export function insertSummary(summary: Omit<SummaryRow, "created_at" | "updated_
     return { ...summary, created_at: ts, updated_at: ts };
 }
 
-export function updateSummaryContent(id: string, content: string, tokenCount: number): void {
+export function updateSummaryContent(
+    id: string,
+    content: string,
+    tokenCount: number,
+    metadata?: string
+): void {
     const ts = now();
+    if (metadata === undefined) {
+        runSql(
+            "UPDATE summaries SET content = ?, token_count = ?, updated_at = ? WHERE id = ?",
+            [content, tokenCount, ts, id]
+        );
+        return;
+    }
     runSql(
-        "UPDATE summaries SET content = ?, token_count = ?, updated_at = ? WHERE id = ?",
-        [content, tokenCount, ts, id]
+        "UPDATE summaries SET content = ?, token_count = ?, metadata = ?, updated_at = ? WHERE id = ?",
+        [content, tokenCount, metadata, ts, id]
     );
 }
 
@@ -750,6 +796,24 @@ export function endSessionRecord(sessionId: string): void {
         "UPDATE sessions SET ended_at = ? WHERE id = ?",
         [ts, sessionId]
     );
+}
+
+/** End one session and create its successor in one SQLite transaction. */
+export function transitionSessionRecord(previousSessionId: string, nextSession: SessionRow): void {
+    const ts = now();
+    withDatabaseTransaction(() => {
+        runSql("UPDATE sessions SET ended_at = ? WHERE id = ?", [ts, previousSessionId]);
+        runSql(
+            `INSERT INTO sessions (id, started_at, ended_at, metadata)
+         VALUES (?, ?, ?, ?)`,
+            [
+                nextSession.id,
+                nextSession.started_at,
+                nextSession.ended_at ?? null,
+                nextSession.metadata,
+            ]
+        );
+    });
 }
 
 export function getSessionById(sessionId: string): SessionRow | undefined {
