@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, test } from "node:test";
@@ -22,7 +22,7 @@ const originalEnv = {
 const tempDirs: string[] = [];
 
 function tempDir(): string {
-    const dir = mkdtempSync(join(tmpdir(), "latentcontext-test-"));
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "latentcontext-test-")));
     tempDirs.push(dir);
     return dir;
 }
