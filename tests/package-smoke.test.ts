@@ -93,8 +93,8 @@ test("packed build resolves the default embedding runtime offline and completes 
         ["pack", "--json", "--pack-destination", packDir],
         projectRoot,
         "utf8"
-    ) as string) as Array<{ filename: string }>;
-    const tarballName = packed[0]?.filename;
+    ) as string) as Array<{ filename: string }> | Record<string, { filename: string }>;
+    const tarballName = Object.values(packed)[0]?.filename;
     assert.ok(tarballName, "npm pack must produce a tarball");
     const tarball = join(packDir, tarballName);
     assert.ok(existsSync(tarball), "the packed tarball must exist");
