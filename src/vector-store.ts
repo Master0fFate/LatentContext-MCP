@@ -1,4 +1,4 @@
-import { v4 as uuidv4 } from "uuid";
+import { randomUUID } from "node:crypto";
 import {
     insertVector,
     getAllVectors,
@@ -6,7 +6,6 @@ import {
     deleteVectorsBySourceId,
     getVectorCount,
     getDb,
-    type VectorRow,
 } from "./database.js";
 import {
     embed,
@@ -117,7 +116,7 @@ export async function prepareVector(
 ): Promise<PreparedVector> {
     const embedding = await embed(content);
     return {
-        id: uuidv4(),
+        id: randomUUID(),
         sourceId,
         sourceType,
         contentPreview: content.length > 200 ? content.substring(0, 200) + "..." : content,
@@ -169,7 +168,7 @@ export function addVectorDirect(
     confidence: number = 1.0,
     metadata: Record<string, unknown> = {}
 ): string {
-    const id = uuidv4();
+    const id = randomUUID();
     const preview =
         content.length > 200 ? content.substring(0, 200) + "..." : content;
 

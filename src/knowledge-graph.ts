@@ -1,4 +1,4 @@
-import { v4 as uuidv4 } from "uuid";
+import { randomUUID } from "node:crypto";
 import {
     upsertEntity,
     getEntityByLabel,
@@ -66,7 +66,7 @@ export function ensureEntity(
         return existing.id;
     }
 
-    const id = uuidv4();
+    const id = randomUUID();
     upsertEntity(id, label, entityType, properties, confidence);
     return id;
 }
@@ -91,7 +91,7 @@ export function storeFact(
     const subjectId = ensureEntity(subjectLabel, subjectType, {}, confidence);
     const objectId = ensureEntity(objectLabel, objectType, {}, confidence);
 
-    const relationId = uuidv4();
+    const relationId = randomUUID();
     upsertRelation(relationId, subjectId, predicate, objectId, properties, confidence);
 
     return relationId;

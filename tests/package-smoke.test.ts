@@ -35,14 +35,23 @@ function runNpm(args: string[], cwd: string, encoding?: "utf8"): string | Buffer
         encoding,
         stdio: encoding ? ["ignore", "pipe", "pipe"] : "pipe",
         shell: process.platform === "win32",
-        // npm publish --dry-run propagates this flag to prepublishOnly. The
-        // nested npm pack must produce a real tarball for this smoke test.
-        env: { ...process.env, npm_config_dry_run: "false" },
+        env: {
+            ...process.env,
+            // npm publish --dry-run propagates this flag to prepublishOnly.
+            // The nested npm pack must produce a real tarball for this test.
+            npm_config_dry_run: "false",
+            // onnxruntime-node's postinstall may try to download optional
+            // CUDA binaries on Linux x64; they are irrelevant to this test.
+            ONNXRUNTIME_NODE_INSTALL_CUDA: "skip",
+        },
     });
 }
 
-function toolText(result: { content: Array<{ type: string; text?: string }> }): string {
-    const content = result.content.find((item) => item.type === "text");
+type ToolResult = Awaited<ReturnType<Client["callTool"]>>;
+
+function toolText(result: ToolResult): string {
+    assert.ok("content" in result && Array.isArray(result.content), "tool response must use the content array");
+    const content = (result.content as Array<{ type: string; text?: string }>).find((item) => item.type === "text");
     assert.ok(content?.text, "tool response must contain text content");
     return content.text;
 }
@@ -99,10 +108,11 @@ test("packed build resolves the default embedding runtime offline and completes 
     // Install only production dependencies from the actual tarball. This
     // catches both omitted publish files and runtime dependencies incorrectly
     // left in devDependencies.
-    // `--offline` makes npm fail rather than reaching the registry. The test
-    // consumes the dependency cache populated by the project's locked install,
-    // while the packed artifact itself remains the only package under test.
-    runNpm(["install", "--offline", "--omit=dev", "--no-audit", "--no-fund", tarball], installProject);
+    // `--prefer-offline` reuses the dependency cache populated by the
+    // project's own install wherever possible. A fully offline install is not
+    // viable after `npm ci`, which caches tarballs but not the registry
+    // metadata needed to resolve the packed package's dependency ranges.
+    runNpm(["install", "--prefer-offline", "--omit=dev", "--no-audit", "--no-fund", tarball], installProject);
 
     const installedPackageDir = join(installProject, "node_modules", packageManifest.name);
     const installedManifest = JSON.parse(readFileSync(join(installedPackageDir, "package.json"), "utf8")) as {
@@ -181,6 +191,7 @@ test("packed build resolves the default embedding runtime offline and completes 
         assert.deepEqual(client.getServerVersion(), {
             name: packageManifest.name,
             version: packageManifest.version,
+            title: "LatentContext",
         });
 
         const tools = await client.listTools(undefined, { timeout: 10_000 });

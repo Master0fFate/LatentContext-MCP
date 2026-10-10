@@ -1,27 +1,17 @@
-import { v4 as uuidv4 } from "uuid";
+import { randomUUID } from "node:crypto";
 import { getConfig } from "./config.js";
 import {
     insertSummary,
     getSummariesByTier,
     getSummariesByTierAndSession,
-    getSummariesByTierExcludingSession,
     getSummaryById,
     updateSummaryContent,
     deleteSummary,
     getSummaryCountByTier,
-    getTotalSummaryTokens,
     withDatabaseTransaction,
     type SummaryRow,
 } from "./database.js";
-import {
-    storeFact,
-    queryEntity,
-    ensureEntity,
-    getAllFacts,
-    getGraphStats,
-    removeEntity,
-    serializeFacts,
-} from "./knowledge-graph.js";
+import { storeFact, ensureEntity, getGraphStats } from "./knowledge-graph.js";
 import {
     prepareVector,
     persistPreparedVector,
@@ -210,7 +200,7 @@ export async function archiveWorkingMemory(sessionId: string): Promise<string | 
         config.tokenBudgets.tier1Session
     );
 
-    const summaryId = uuidv4();
+    const summaryId = randomUUID();
     const compressedTokens = countTokens(compressed);
 
     // Embedding is deliberately outside the transaction; all related rows
@@ -280,7 +270,6 @@ export async function storeMemory(
     confidence: number = 1.0,
     entities: string[] = []
 ): Promise<StoreResult> {
-    const config = getConfig();
     const sessionId = getCurrentSessionIdOrNull();
     const result: StoreResult = {
         memoryId: "",
@@ -294,7 +283,7 @@ export async function storeMemory(
 
     switch (memoryType) {
         case "core": {
-            const summaryId = uuidv4();
+            const summaryId = randomUUID();
             const tokens = countTokens(content);
             const vector = await prepareVector(content, summaryId, "core", confidence, {
                 memoryType: "core", entities, sessionId,
@@ -314,7 +303,7 @@ export async function storeMemory(
         }
 
         case "fact": {
-            const factId = uuidv4();
+            const factId = randomUUID();
             const tokens = countTokens(content);
             const vector = await prepareVector(content, factId, "fact", confidence, {
                 memoryType: "fact", entities, sessionId,
@@ -324,7 +313,7 @@ export async function storeMemory(
                     ensureEntity(entityLabel, "unknown", {}, confidence);
                 }
                 if (entities.length >= 2) {
-                    const predicate = inferPredicate(content, entities);
+                    const predicate = inferPredicate(content);
                     for (let i = 1; i < entities.length; i++) {
                         storeFact(entities[0], predicate, entities[i], "unknown", "unknown", confidence);
                     }
@@ -348,7 +337,7 @@ export async function storeMemory(
         }
 
         case "preference": {
-            const prefId = uuidv4();
+            const prefId = randomUUID();
             const tokens = countTokens(content);
             const vector = await prepareVector(content, prefId, "preference", confidence, {
                 memoryType: "preference", entities, sessionId,
@@ -380,7 +369,7 @@ export async function storeMemory(
         case "event": {
             // Tier 0's in-memory view is updated only after its summary and
             // vector checkpoint commit, so cache and database never diverge.
-            const eventId = uuidv4();
+            const eventId = randomUUID();
             const tokens = countTokens(content);
             const eventVector = await prepareVector(content, eventId, "event", confidence, {
                 memoryType: "event", entities, timestamp: new Date().toISOString(), sessionId,
@@ -410,7 +399,7 @@ export async function storeMemory(
         }
 
         case "summary": {
-            const sumId = uuidv4();
+            const sumId = randomUUID();
             const tokens = countTokens(content);
             const vector = await prepareVector(content, sumId, "summary", confidence, {
                 memoryType: "summary", entities, sessionId,
@@ -469,7 +458,7 @@ async function checkTier0Overflow(): Promise<void> {
         config.tokenBudgets.tier1Session
     );
 
-    const summaryId = uuidv4();
+    const summaryId = randomUUID();
     const tokens = countTokens(compressed);
 
     const compressedVector = await prepareVector(compressed, summaryId, "summary", 0.9, {
@@ -534,7 +523,7 @@ export async function compressMemory(scope: CompressScope): Promise<string> {
                 config.tokenBudgets.tier1Session
             );
 
-            const summaryId = uuidv4();
+            const summaryId = randomUUID();
             const compressedTokens = countTokens(compressed);
 
             const compressedVector = await prepareVector(compressed, summaryId, "summary", 0.9, { sessionId });
@@ -589,7 +578,7 @@ export async function compressMemory(scope: CompressScope): Promise<string> {
                 config.tokenBudgets.tier1Session * 2
             );
 
-            const summaryId = uuidv4();
+            const summaryId = randomUUID();
             const compressedTokens = countTokens(compressed);
 
             const compressedVector = await prepareVector(compressed, summaryId, "summary", 0.85, { sessionId });
@@ -640,7 +629,7 @@ export async function compressMemory(scope: CompressScope): Promise<string> {
                 config.tokenBudgets.tier2Epoch
             );
 
-            const epochId = uuidv4();
+            const epochId = randomUUID();
             const compressedTokens = countTokens(compressed);
 
             const epochVector = await prepareVector(compressed, epochId, "epoch", 0.8, { sessionId });
@@ -797,10 +786,10 @@ export function getCurrentSessionMemory(): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Simple heuristic to infer a predicate from content and entity mentions.
+ * Simple heuristic to infer a predicate from content.
  * In production, the LLM would do this via the extract_facts prompt.
  */
-function inferPredicate(content: string, entities: string[]): string {
+function inferPredicate(content: string): string {
     const lower = content.toLowerCase();
 
     // Common predicate patterns

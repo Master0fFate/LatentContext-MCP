@@ -1,8 +1,12 @@
-import initSqlJs, { type Database as SqlJsDatabase } from "sql.js";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from "fs";
-import { join, dirname } from "path";
-import { createRequire } from "module";
+import initSqlJs from "sql.js";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { createRequire } from "node:module";
 import { getConfig } from "./config.js";
+
+type SqlJsDatabase = initSqlJs.Database;
+/** Values sql.js can bind to a prepared statement. */
+export type SqlParam = number | string | Uint8Array | null;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -191,12 +195,7 @@ export async function initDatabase(): Promise<SqlJsDatabase> {
         // Fallback: let sql.js find its own WASM file
     }
 
-    const sqlJsConfig: Record<string, unknown> = {};
-    if (wasmPath) {
-        sqlJsConfig.locateFile = () => wasmPath;
-    }
-
-    const SQL = await initSqlJs(sqlJsConfig);
+    const SQL = await initSqlJs(wasmPath ? { locateFile: () => wasmPath } : {});
 
     // Load existing database or create new one
     if (existsSync(_dbPath)) {
@@ -321,26 +320,27 @@ export function closeDatabase(): void {
 // Helper: run a query and return typed rows
 // ---------------------------------------------------------------------------
 
-function queryAll<T>(sql: string, params: unknown[] = []): T[] {
+function queryAll<T>(sql: string, params: SqlParam[] = []): T[] {
     const db = getDb();
     const stmt = db.prepare(sql);
-    if (params.length > 0) stmt.bind(params);
-
-    const results: T[] = [];
-    while (stmt.step()) {
-        const row = stmt.getAsObject() as T;
-        results.push(row);
+    try {
+        if (params.length > 0) stmt.bind(params);
+        const results: T[] = [];
+        while (stmt.step()) {
+            results.push(stmt.getAsObject() as unknown as T);
+        }
+        return results;
+    } finally {
+        stmt.free();
     }
-    stmt.free();
-    return results;
 }
 
-function queryOne<T>(sql: string, params: unknown[] = []): T | undefined {
+function queryOne<T>(sql: string, params: SqlParam[] = []): T | undefined {
     const results = queryAll<T>(sql, params);
     return results.length > 0 ? results[0] : undefined;
 }
 
-function runSql(sql: string, params: unknown[] = []): void {
+function runSql(sql: string, params: SqlParam[] = []): void {
     const db = getDb();
     db.run(sql, params);
     if (_transactionDepth === 0) saveDatabaseSync();

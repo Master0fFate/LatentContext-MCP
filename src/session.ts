@@ -1,5 +1,4 @@
-import { v4 as uuidv4 } from "uuid";
-import { getConfig } from "./config.js";
+import { randomUUID } from "node:crypto";
 import {
     insertSession,
     endSessionRecord,
@@ -77,7 +76,7 @@ export async function startSession(
     // Generate locally first; publish it to module state only after the
     // database transition has reached its durable checkpoint.
     const timestamp = Date.now();
-    const nextSessionId = `${timestamp}-${uuidv4()}`;
+    const nextSessionId = `${timestamp}-${randomUUID()}`;
     const nextStartedAt = new Date(timestamp).toISOString();
     const nextSession: SessionRow = {
         id: nextSessionId,

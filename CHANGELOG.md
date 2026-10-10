@@ -1,0 +1,78 @@
+# Changelog
+
+All notable changes to this project are documented here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
+[Semantic Versioning](https://semver.org/).
+
+## [2.0.0] - 2026-10-10
+
+### Breaking changes
+
+- Node.js 20 or later is required. Node.js 18 reached end of life and is no
+  longer supported.
+- The `memory_forget` input schema no longer uses `allOf`/`if`/`then`/`else`
+  to require `correction` for the `correct` action, and the `memory_retrieve`
+  date filters no longer declare `format`/`pattern`. These rules are still
+  enforced, but by the server with explicit error messages, because several
+  MCP hosts reject those JSON Schema keywords when translating tool schemas
+  for their model provider.
+- Validation errors for unknown arguments and out-of-range values now use the
+  wording produced by the schema validator (for example
+  `Unrecognized key: "x"`). Errors for the server's own rules
+  (word count, ISO datetimes, UUIDs, `correction` handling) are unchanged.
+- The server advertises `title: "LatentContext"` in its `serverInfo`.
+
+### Added
+
+- Tool `title` and `annotations` (`readOnlyHint`, `destructiveHint`,
+  `idempotentHint`, `openWorldHint`) so hosts can label tools and decide which
+  calls need confirmation.
+- `outputSchema` and `structuredContent` for `session_start`, `memory_store`,
+  `memory_retrieve`, and `memory_status`.
+- Server `instructions` describing how the tools fit together, delivered to
+  hosts during initialization.
+- The `logging` capability. Lifecycle events and tool failures are forwarded
+  as `notifications/message` after the handshake, in addition to the log
+  file. Clients can tune verbosity with `logging/setLevel`.
+- `LATENTCONTEXT_HIDE_CONSOLE=0` to keep the console window visible on
+  Windows.
+- GitHub Actions CI covering Linux, macOS, and Windows on Node.js 20, 22,
+  and 24.
+- `npm run typecheck` (also covers tests and benchmarks) and `npm run check`.
+
+### Changed
+
+- Migrated from the low-level `Server` request handlers to `McpServer` with
+  `registerTool`, `registerResource`, and `registerPrompt`; tool inputs are
+  declared with zod and validated by the SDK before handlers run.
+- Upgraded `@modelcontextprotocol/sdk` to 1.32, `zod` to 4, and
+  `@huggingface/transformers` to 4.
+- IDs are generated with `node:crypto` `randomUUID()`; the `uuid` dependency
+  was removed.
+- `sql.js` types come from `@types/sql.js` instead of a local declaration
+  file.
+- TypeScript 7 with `NodeNext` module resolution, `verbatimModuleSyntax`,
+  and `erasableSyntaxOnly`.
+- Diagnostics moved into `src/logger.ts`; the log file uses MCP log level
+  names.
+
+### Fixed
+
+- The package smoke test no longer depends on registry metadata being cached,
+  so it passes after a clean `npm ci`.
+- `@huggingface/transformers` log verbosity is set with the numeric level the
+  library expects, rather than a string it ignored.
+
+## [1.2.0]
+
+- Scope runtime state to the launched project.
+
+## [1.1.1]
+
+- npm package distribution.
+
+## [1.1.0]
+
+- Storage isolation and stdio hardening.
+
+[2.0.0]: https://github.com/Master0fFate/LatentContext-MCP/compare/v1.2.0...v2.0.0

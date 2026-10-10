@@ -36,20 +36,16 @@ async function initPipeline(): Promise<void> {
         const modelName = config.embedding.model;
 
         try {
-            // Dynamic import to avoid loading the heavy ONNX runtime at module level
-            const { pipeline, env } = await import("@huggingface/transformers");
+            // Dynamic import keeps the ONNX runtime out of the startup path;
+            // it is only loaded once an embedding is actually requested.
+            const transformers = await import("@huggingface/transformers");
+            const { pipeline, env } = transformers;
 
-            // Suppress all HuggingFace progress output — these progress bars
-            // and status messages would corrupt the MCP JSON-RPC protocol
-            // since they write to stdout/stderr.
-            if (env) {
-                // Disable remote model fetching progress bars
-                (env as Record<string, unknown>).allowRemoteModels = true;
-                // Some versions of @huggingface/transformers support log level
-                if ("logLevel" in env) {
-                    (env as Record<string, unknown>).logLevel = "error";
-                }
-            }
+            // The library logs download progress and runtime status. Process
+            // output is already redirected to the log file, but keeping the
+            // library quiet avoids filling that file with progress bars.
+            env.allowRemoteModels = true;
+            env.logLevel = transformers.LogLevel?.ERROR ?? 40;
 
             _pipeline = (await pipeline("feature-extraction", modelName, {
                 dtype: "fp32",
@@ -100,8 +96,8 @@ export async function embed(text: string): Promise<number[]> {
 
         const vectors = result.tolist();
         return vectors[0];
-    } catch (error) {
-        // Embedding call failed — return zero vector instead of crashing
+    } catch {
+        // Embedding call failed: return a zero vector instead of crashing.
         return new Array(config.embedding.dimensions).fill(0);
     }
 }

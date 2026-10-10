@@ -1,31 +1,33 @@
 {
     "name": "latentcontext-mcp",
-    "version": "1.2.0",
-    "description": "LatentContext MCP Server — Intelligent memory and context management for LLMs",
+    "version": "2.0.0",
+    "description": "LatentContext MCP Server: session-isolated memory, summaries, and a knowledge graph for MCP hosts",
     "type": "module",
     "main": "dist/index.js",
     "types": "dist/index.d.ts",
+    "bin": {
+        "latentcontext-mcp": "dist/index.js"
+    },
     "files": [
         "dist",
         "README.md",
         "LICENSE"
     ],
-    "bin": {
-        "latentcontext-mcp": "dist/index.js"
-    },
     "scripts": {
-        "build": "tsc && node scripts/make-bin-executable.mjs",
+        "build": "tsc -p tsconfig.json && node scripts/make-bin-executable.mjs",
         "start": "node dist/index.js",
         "dev": "tsx src/index.ts",
+        "typecheck": "tsc -p tsconfig.check.json",
         "test": "node --import tsx --test tests/*.test.ts",
         "test:smoke": "node --import tsx --test tests/package-smoke.test.ts",
+        "check": "npm run typecheck && npm test",
         "audit:production": "npm audit --omit=dev --audit-level=moderate",
         "benchmark:retrieval": "node --import tsx benchmarks/retrieval.bench.ts",
         "prepack": "npm run build",
-        "prepublishOnly": "npm test && npm audit --audit-level=low"
+        "prepublishOnly": "npm run check && npm audit --audit-level=low"
     },
     "engines": {
-        "node": ">=18"
+        "node": ">=20"
     },
     "repository": {
         "type": "git",
@@ -40,25 +42,28 @@
     },
     "keywords": [
         "mcp",
+        "model-context-protocol",
+        "mcp-server",
         "llm",
         "context",
         "memory",
         "knowledge-graph",
-        "vector-search"
+        "vector-search",
+        "claude",
+        "cursor"
     ],
     "license": "MIT",
     "dependencies": {
-        "@huggingface/transformers": "^3.4.0",
-        "@modelcontextprotocol/sdk": "^1.12.0",
-        "js-tiktoken": "^1.0.19",
-        "sql.js": "^1.12.0",
-        "uuid": "^11.1.0",
-        "zod": "^3.24.0"
+        "@huggingface/transformers": "^4.3.1",
+        "@modelcontextprotocol/sdk": "^1.32.1",
+        "js-tiktoken": "^1.0.21",
+        "sql.js": "^1.14.2",
+        "zod": "^4.6.5"
     },
     "devDependencies": {
-        "@types/node": "^22.13.0",
-        "@types/uuid": "^10.0.0",
-        "tsx": "^4.23.1",
-        "typescript": "^5.7.0"
+        "@types/node": "^22.20.5",
+        "@types/sql.js": "^1.4.11",
+        "tsx": "^4.23.15",
+        "typescript": "^7.0.2"
     }
 }
