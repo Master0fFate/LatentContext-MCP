@@ -30,6 +30,25 @@ LatentContext is a local [Model Context Protocol](https://modelcontextprotocol.i
 
 Everything runs in-process over stdio. No database server, no native build step, no API keys, and no child processes per tool call.
 
+> [!IMPORTANT]
+> **New in 3.0:** LatentContext now covers memory, code intelligence, and code review in one server. `code_explore` indexes 19 languages with tree-sitter. Four `review_*` tools run plan-driven reviews with syntax and security checks. Project state in `.latentcontext/` keeps itself out of git. See the [changelog](CHANGELOG.md).
+
+## Tools at a glance
+
+| Area | Tool | What it does |
+| --- | --- | --- |
+| 🧭 Code | [`code_explore`](#code_explore) | Finds symbols by name, file, or question. Returns their source, call paths, references, and impact. |
+| 🔍 Review | [`review_start`](#code-review) | Registers plan steps and picks a review lens. |
+| | [`review_chunk`](#code-review) | Checks a changed chunk and returns a verdict, merged findings, patch hints, and caller context. |
+| | [`review_status`](#code-review) | Lists live reviews, or shows one review's steps and open findings. |
+| | [`review_end`](#code-review) | Deletes a review and its history. |
+| 🧠 Memory | [`session_start`](#memory) | Starts a fresh session and archives the previous one. |
+| | [`memory_store`](#memory) | Records a note, decision, fact, or event. |
+| | [`memory_retrieve`](#memory) | Returns relevant context within a token budget. |
+| | [`memory_compress`](#memory) | Compresses working memory or summaries. |
+| | [`memory_forget`](#memory) | Deprecates, corrects, or deletes a memory. |
+| | [`memory_status`](#memory) | Reports storage and session statistics. |
+
 ## Highlights
 
 | | |

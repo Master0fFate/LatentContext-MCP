@@ -96,6 +96,7 @@ async function main(): Promise<void> {
         isShuttingDown = true;
         let shutdownFailed = false;
         log("info", `Shutdown requested (${reason})`);
+        closeCodeIndexes();
 
         try {
             await endCurrentSessionWithArchive(archiveWorkingMemory);
@@ -105,8 +106,6 @@ async function main(): Promise<void> {
             // The durable checkpoint is retained for recovery on next boot.
             log("error", "Error archiving and ending session", error);
         }
-
-        closeCodeIndexes();
 
         try {
             closeDatabase();

@@ -4,6 +4,33 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [3.0.0] - 2026-10-15
+
+LatentContext 3.0 brings session memory, code intelligence, and code review
+together in one server. It collects the 2.1 and 2.2 work into a single major
+release. Tool names and schemas from 2.x are unchanged.
+
+### Highlights
+
+- `code_explore`: a tree-sitter code index for 19 languages with call
+  paths, references, callees, and impact in one call.
+- `review_start`, `review_chunk`, `review_status`, and `review_end`:
+  plan-driven code review with syntax and security checks, caller impact,
+  verdicts, and patch hints.
+- Project state in `.latentcontext/` ignores itself in git.
+
+### Changed
+
+- On shutdown, the server releases its file watchers and worker threads
+  before it archives the session, so hosts can delete or move the project
+  folder right after closing the connection.
+- The README opens with a table of all eleven tools.
+
+### Fixed
+
+- The Windows CI job no longer fails when test cleanup deletes a folder the
+  server is still releasing.
+
 ## [2.2.0] - 2026-10-15
 
 ### Added
@@ -123,6 +150,8 @@ All notable changes to this project are documented here. The format follows
 
 - Storage isolation and stdio hardening.
 
+[3.0.0]: https://github.com/Master0fFate/LatentContext-MCP/compare/v2.2.0...v3.0.0
+[2.2.0]: https://github.com/Master0fFate/LatentContext-MCP/compare/v2.1.1...v2.2.0
 [2.1.1]: https://github.com/Master0fFate/LatentContext-MCP/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/Master0fFate/LatentContext-MCP/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/Master0fFate/LatentContext-MCP/compare/v1.2.0...v2.0.0

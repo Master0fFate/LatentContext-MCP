@@ -17,7 +17,7 @@ const CALL_OPTIONS = { timeout: 10_000 };
 
 after(() => {
     for (const dir of tempDirs.splice(0)) {
-        rmSync(dir, { recursive: true, force: true });
+        rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     }
 });
 
