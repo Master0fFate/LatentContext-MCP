@@ -2,7 +2,7 @@
 
 # LatentContext
 
-**Session memory, a knowledge graph, and a live code index for any MCP host.**
+**Session memory, a knowledge graph, a live code index, and stateful code review for any MCP host.**
 
 [![CI](https://github.com/Master0fFate/LatentContext-MCP/actions/workflows/ci.yml/badge.svg)](https://github.com/Master0fFate/LatentContext-MCP/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/latentcontext-mcp?color=cb3837&logo=npm)](https://www.npmjs.com/package/latentcontext-mcp)
@@ -12,6 +12,7 @@
 
 [Quick start](#quick-start) ·
 [Code intelligence](#code-intelligence) ·
+[Code review](#code-review) ·
 [Memory](#memory) ·
 [Host setup](#host-setup) ·
 [Configuration](#configuration) ·
@@ -21,10 +22,11 @@
 
 ---
 
-LatentContext is a local [Model Context Protocol](https://modelcontextprotocol.io/) server. It gives an assistant two things it normally lacks:
+LatentContext is a local [Model Context Protocol](https://modelcontextprotocol.io/) server. It gives an assistant three things it normally lacks:
 
 - **A memory** that survives the context window: notes, session summaries, a knowledge graph, and optional local embeddings in SQLite.
 - **A map of your code**: a tree-sitter index of every symbol, call, and reference in the project, kept fresh by file watchers and answered in one tool call.
+- **A review ledger**: plan-driven code review with syntax and security checks, caller impact, verdicts, and step tracking.
 
 Everything runs in-process over stdio. No database server, no native build step, no API keys, and no child processes per tool call.
 
@@ -37,6 +39,7 @@ Everything runs in-process over stdio. No database server, no native build step,
 | 🔄 **Always current** | Native recursive watchers on Windows and macOS, per-directory watchers on Linux. Only changed files are re-parsed. |
 | 🪟 **Quiet on Windows** | Tool calls spawn no processes, so no console windows flash. Worker threads do all the heavy work. |
 | 🌍 **19 languages** | TypeScript, TSX, JavaScript, Python, Rust, Go, Java, C#, C, C++, Ruby, PHP, Kotlin, Scala, Lua, Zig, Elixir, Bash, PowerShell. |
+| 🔍 **Stateful code review** | Plan steps, review lenses, syntax and security checks in 19 languages, caller impact, verdicts, and patch hints that persist across restarts. |
 | 🧠 **Session memory** | Tiered working memory, compression, a knowledge graph, and semantic retrieval within a token budget. |
 | 🔌 **Works everywhere** | Portable JSON Schema, tool annotations, output schemas, and server instructions for Claude Code, Claude Desktop, Cursor, VS Code, Windsurf, Codex CLI, Gemini CLI, and more. |
 
@@ -189,6 +192,36 @@ The project to index is picked in this order:
 
 The home directory and drive roots are never indexed.
 
+## Code review
+
+Four tools run a stateful review against a plan. The model does the judging; the server adds deterministic checks, caller impact from the code index, a verdict, and a ledger that survives restarts.
+
+| Tool | Use | Annotations |
+| --- | --- | --- |
+| `review_start` | Register plan steps and pick a review lens. Returns the review ID and the lens text. | |
+| `review_chunk` | Submit a changed chunk for one step, with your own findings. Returns the verdict, merged findings, patch hints, and caller context. | |
+| `review_status` | List live reviews, or show one review's steps, last verdicts, and open findings. | read-only |
+| `review_end` | Delete a review and its chunk history. | destructive, idempotent |
+
+```text
+review_start { "steps": ["Harden path handling", "Remove shell calls"], "profile": "cybersec-auditor-general-v2.0" }
+review_chunk { "review_id": "…", "step": 2, "file": "src/run.ts", "code": "…", "findings": [{ "severity": "high", "category": "logic", "message": "Exit code is ignored.", "line": 4 }] }
+```
+
+What `review_chunk` adds on top of your findings:
+
+- **Syntax**: tree-sitter parse errors and missing tokens for all 19 indexed languages.
+- **Security**: language-aware rules for `eval`, shell execution, unsafe deserialization, raw HTML sinks, disabled TLS checks, SQL built by interpolation, unbounded C buffer writes, hardcoded secrets, private keys, and AWS keys.
+- **Debug leftovers**: `debugger`, `pdb.set_trace()`, `breakpoint()`, and `dbg!`.
+- **Patch hints**: exact search and replace pairs, only where a drop-in fix exists (for example `yaml.load(` → `yaml.safe_load(`, or a hardcoded JS secret → `process.env.NAME`).
+- **Context**: for each symbol the chunk defines (or the `symbol` you name), its references, first callers, and impact from the code index.
+
+Any `critical` or `high` finding makes the verdict `NEEDS_WORK` and keeps the step `IN_PROGRESS`; otherwise the step is `VALIDATED`. A review is `COMPLETED` when every step is validated. Finding lines are relative to the chunk; context lines are relative to the file. Reviews expire 7 days after their last update.
+
+### Review lenses
+
+A lens is a Markdown prompt that sets what the review looks for. Four ship with the package: `universal-auditor-general-v3` (the default), `cybersec-auditor-general-v2.0`, `performance-reliability-auditor-v2.0`, and `design-audit-director-v2.0`. The `profile` argument is an enum of the available lenses, so hosts show them without an extra tool. Set `LATENTCONTEXT_REVIEW_PROFILES` to a directory of `*.md` files to use your own; the file name is the ID and the first `#` heading is the title.
+
 ## Memory
 
 | Tool | Use | Annotations |
@@ -202,7 +235,7 @@ The home directory and drive roots are never indexed.
 
 Stored notes need at least 10 words; 25 or more are recommended. Working memory is isolated by session ID, and it is archived when a session changes or the server shuts down.
 
-`session_start`, `memory_store`, `memory_retrieve`, `memory_status`, and `code_explore` return `structuredContent` that matches a published `outputSchema`.
+`session_start`, `memory_store`, `memory_retrieve`, `memory_status`, `code_explore`, `review_start`, `review_chunk`, and `review_status` return `structuredContent` that matches a published `outputSchema`.
 
 <details>
 <summary><b>Resources and prompts</b></summary>
@@ -290,7 +323,8 @@ Add the `mcpServers` block to `~/.gemini/settings.json`, or to `.gemini/settings
 | Variable | Effect |
 | --- | --- |
 | `LATENTCONTEXT_CODE_ROOT` | Project directory (or directories) for `code_explore`. Overrides client roots. |
-| `LATENTCONTEXT_CODE_INDEX` | Set to `0` or `off` to disable the code index and hide `code_explore`. |
+| `LATENTCONTEXT_CODE_INDEX` | Set to `0` or `off` to disable the code index and hide `code_explore`. Reviews then skip caller context. |
+| `LATENTCONTEXT_REVIEW_PROFILES` | Directory of `*.md` review lenses. Replaces the bundled lenses. |
 | `LATENTCONTEXT_DATA_DIR` | Directory for `memory.db`, `server.log`, and `code-index/`. Overrides every other storage setting. |
 | `LATENTCONTEXT_CONFIG` | Path to a `latentcontext.config.json` to load. |
 | `LATENTCONTEXT_ALLOW_PROJECT_CONFIG` | Set to `1` to also read `latentcontext.config.json` from the launched project. |

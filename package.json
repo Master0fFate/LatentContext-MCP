@@ -1,7 +1,7 @@
 {
     "name": "latentcontext-mcp",
-    "version": "2.1.1",
-    "description": "LatentContext MCP Server: session-isolated memory, a knowledge graph, and a live code index with call graphs for MCP hosts",
+    "version": "2.2.0",
+    "description": "LatentContext MCP Server: session-isolated memory, a knowledge graph, a live code index with call graphs, and stateful code review for MCP hosts",
     "type": "module",
     "main": "dist/index.js",
     "types": "dist/index.d.ts",
@@ -11,6 +11,7 @@
     "files": [
         "dist",
         "grammars",
+        "prompts",
         "README.md",
         "LICENSE"
     ],
@@ -55,7 +56,8 @@
         "code-search",
         "code-intelligence",
         "call-graph",
-        "tree-sitter"
+        "tree-sitter",
+        "code-review"
     ],
     "license": "MIT",
     "dependencies": {

@@ -113,6 +113,10 @@ test("MCP stdio discovery and session memory workflow remain JSON-RPC-safe", asy
             "memory_retrieve",
             "memory_status",
             "memory_store",
+            "review_chunk",
+            "review_end",
+            "review_start",
+            "review_status",
             "session_start",
         ]);
         assert.deepEqual(
@@ -125,6 +129,10 @@ test("MCP stdio discovery and session memory workflow remain JSON-RPC-safe", asy
                 memory_forget: "Deprecate, correct, or delete a memory.",
                 memory_status: "Show memory storage and session status.",
                 code_explore: "Find code by names or question; source plus call graph.",
+                review_start: "Start a code review from plan steps; returns the lens.",
+                review_chunk: "Check a code chunk for a review step; verdict and fixes.",
+                review_status: "List live reviews or show one review's step progress.",
+                review_end: "Delete a review and its chunk history.",
             }
         );
         for (const tool of tools.values()) {
@@ -148,6 +156,10 @@ test("MCP stdio discovery and session memory workflow remain JSON-RPC-safe", asy
                 memory_forget: false,
                 memory_status: true,
                 code_explore: true,
+                review_start: false,
+                review_chunk: false,
+                review_status: true,
+                review_end: false,
             }
         );
         assert.equal(tools.get("memory_compress")?.annotations?.destructiveHint, true);

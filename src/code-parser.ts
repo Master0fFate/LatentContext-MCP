@@ -10,6 +10,16 @@ export interface ParsedFile {
     refs: RefTuple[];
 }
 
+export interface SyntaxIssue {
+    line: number;
+    missing: string | null;
+    text: string;
+}
+
+export interface CheckedSource extends ParsedFile {
+    issues: SyntaxIssue[];
+}
+
 interface Grammar {
     language: Language;
     query: Query;
@@ -34,6 +44,8 @@ interface Reference {
 
 const MAX_NAME_LENGTH = 120;
 const MAX_SIGNATURE_LENGTH = 200;
+const MAX_SYNTAX_ISSUES = 20;
+const MAX_ISSUE_TEXT = 60;
 const EMPTY: ParsedFile = { symbols: [], refs: [] };
 
 const KIND_PRIORITY: Record<SymbolKind, number> = {
@@ -170,16 +182,43 @@ function build(source: string, definitions: Map<number, Definition>, references:
     return { symbols, refs: refTuples };
 }
 
-export async function parseSource(lang: LanguageId, source: string): Promise<ParsedFile> {
-    if (source.length === 0 || source.includes("\0")) return EMPTY;
+function syntaxIssues(root: Node): SyntaxIssue[] {
+    const issues: SyntaxIssue[] = [];
+    const pending = root.hasError ? [root] : [];
+    while (pending.length > 0 && issues.length < MAX_SYNTAX_ISSUES) {
+        const node = pending.pop()!;
+        const line = node.startPosition.row + 1;
+        if (node.isMissing) issues.push({ line, missing: node.type, text: "" });
+        else if (node.isError) issues.push({ line, missing: null, text: node.text.slice(0, MAX_ISSUE_TEXT).trim() });
+        else for (const child of node.children) if (child?.hasError) pending.push(child);
+    }
+    return issues.sort((a, b) => a.line - b.line);
+}
+
+async function withTree<T>(lang: LanguageId, source: string, read: (root: Node, query: Query) => T): Promise<T | null> {
     const [instance, grammar] = await Promise.all([getParser(), getGrammar(lang)]);
     instance.setLanguage(grammar.language);
     const tree = instance.parse(source);
-    if (!tree) return EMPTY;
+    if (!tree) return null;
     try {
-        const { definitions, references } = collect(grammar.query, tree.rootNode);
-        return build(source, definitions, references);
+        return read(tree.rootNode, grammar.query);
     } finally {
         tree.delete();
     }
+}
+
+function symbolsOf(source: string, root: Node, query: Query): ParsedFile {
+    const { definitions, references } = collect(query, root);
+    return build(source, definitions, references);
+}
+
+export async function parseSource(lang: LanguageId, source: string): Promise<ParsedFile> {
+    if (source.length === 0 || source.includes("\0")) return EMPTY;
+    return (await withTree(lang, source, (root, query) => symbolsOf(source, root, query))) ?? EMPTY;
+}
+
+export async function checkSource(lang: LanguageId, source: string): Promise<CheckedSource> {
+    if (source.length === 0 || source.includes("\0")) return { ...EMPTY, issues: [] };
+    return (await withTree(lang, source, (root, query) => ({ ...symbolsOf(source, root, query), issues: syntaxIssues(root) })))
+        ?? { ...EMPTY, issues: [] };
 }

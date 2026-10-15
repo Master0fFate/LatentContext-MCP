@@ -80,7 +80,7 @@ function parseQuery(query: string): QueryTerms {
     return { names, words: [...words], files };
 }
 
-function qualified(symbol: CodeSymbol): string {
+export function qualified(symbol: CodeSymbol): string {
     return symbol.owner ? `${symbol.owner}.${symbol.name}` : symbol.name;
 }
 
@@ -104,7 +104,7 @@ export function resolveRef(ref: CodeRef): CodeSymbol[] {
     return defs.size <= 3 ? [...defs] : [];
 }
 
-function referencesTo(symbol: CodeSymbol): CodeRef[] {
+export function referencesTo(symbol: CodeSymbol): CodeRef[] {
     const refs = symbol.file.index.refsByName.get(symbol.name);
     if (!refs) return [];
     const result: CodeRef[] = [];
@@ -202,7 +202,7 @@ function findPath(from: CodeSymbol, targets: ReadonlySet<CodeSymbol>): CodeSymbo
     return null;
 }
 
-function impactOf(symbol: CodeSymbol): { symbols: number; files: number } {
+export function impactOf(symbol: CodeSymbol): { symbols: number; files: number } {
     const seen = new Set<CodeSymbol>([symbol]);
     const files = new Set<CodeFile>();
     let frontier = [symbol];

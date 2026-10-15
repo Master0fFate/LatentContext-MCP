@@ -17,6 +17,23 @@ import { explore } from "./code-explore.js";
 import { codeIndexEnabled, getCodeIndexes, resolveCodeRoots, watchClientRoots } from "./code-workspace.js";
 import { getGraphSchema } from "./knowledge-graph.js";
 import { log } from "./logger.js";
+import {
+    endReview,
+    formatChunkReview,
+    formatReviewStart,
+    formatReviewSummaries,
+    MAX_REVIEW_STEPS,
+    requireReview,
+    REVIEW_STATUSES,
+    reviewChunk,
+    reviewFilePath,
+    reviewSummaries,
+    startReview,
+    STEP_STATUSES,
+    VERDICTS,
+} from "./review.js";
+import { SEVERITIES } from "./review-checks.js";
+import { defaultReviewProfile, loadReviewProfiles, type ReviewProfile } from "./review-profiles.js";
 import { startSession, getSessionInfo } from "./session.js";
 
 const packageVersion = createRequire(import.meta.url)("../package.json").version as string;
@@ -46,7 +63,9 @@ export const SERVER_INSTRUCTIONS = [
     "Use memory_compress when working memory grows large, memory_forget to deprecate, correct, or delete a note, and memory_status to inspect storage.",
 ].join(" ");
 
-const CODE_INSTRUCTIONS = "Call code_explore before reading or editing source files: one call with symbol names, file names, or a plain question returns the line-numbered source of the matching symbols plus their call paths, references, callees, and impact, so treat the shown source as already read.";
+const REVIEW_INSTRUCTIONS = "For a code review, call review_start with the plan steps and apply the returned review lens, then call review_chunk for each changed chunk with your own findings; it adds syntax and security checks, caller impact, and a verdict, and tracks step status. Use review_status to resume and review_end to delete a finished review.";
+
+const CODE_INSTRUCTIONS ="Call code_explore before reading or editing source files: one call with symbol names, file names, or a plain question returns the line-numbered source of the matching symbols plus their call paths, references, callees, and impact, so treat the shown source as already read.";
 
 export const DEFAULT_EXPLORE_FILES = 10;
 export const DEFAULT_EXPLORE_TOKENS = 8000;
@@ -112,6 +131,98 @@ const exploreOutputSchema = z.object({
         file: z.string(),
         startLine: z.number().int(),
         endLine: z.number().int(),
+    })),
+});
+
+const findingInputSchema = z.object({
+    severity: z.enum(SEVERITIES).describe("Finding severity; critical and high fail the step."),
+    category: z.string().min(1).describe("Short category such as logic, performance, or style."),
+    message: z.string().min(1).describe("What is wrong and why."),
+    line: z.number().int().min(1).optional().describe("Line in the chunk, starting at 1."),
+}).strict();
+
+const reviewChunkInputSchema = z.object({
+    review_id: z.string().min(1).describe("Review ID from review_start."),
+    step: z.number().int().min(1).describe("Plan step number, starting at 1."),
+    file: z.string().min(1).describe("File path, relative to the review root or absolute."),
+    code: z.string().min(1).describe("The changed code."),
+    symbol: z.string().min(1).optional().describe("Enclosing symbol when the code is a fragment."),
+    findings: z.array(findingInputSchema).optional().describe("Your own findings for this chunk."),
+}).strict();
+
+const reviewIdInputSchema = z.object({
+    review_id: z.string().min(1).describe("Review ID from review_start."),
+}).strict();
+
+const reviewStatusInputSchema = z.object({
+    review_id: z.string().min(1).optional().describe("Review ID to inspect. Omit to list live reviews."),
+}).strict();
+
+function reviewStartInputSchema(profiles: readonly ReviewProfile[]) {
+    const ids = profiles.map((profile) => profile.id);
+    const profile = ids.length > 0 ? z.enum(ids as [string, ...string[]]) : z.string().min(1);
+    return z.object({
+        steps: z.array(z.string().min(1)).min(1).describe(`Plan steps to review, in order (up to ${MAX_REVIEW_STEPS}).`),
+        profile: profile.optional().describe(`Review lens. Defaults to ${defaultReviewProfile(profiles)?.id ?? "none"}.`),
+        root: z.string().min(1).optional().describe("Absolute project directory. Defaults to the client roots."),
+    }).strict();
+}
+
+const findingSchema = z.object({
+    severity: z.enum(SEVERITIES),
+    category: z.string(),
+    message: z.string(),
+    line: z.number().int().optional(),
+    evidence: z.string().optional(),
+});
+
+const reviewStartOutputSchema = z.object({
+    reviewId: z.string(),
+    root: z.string(),
+    profile: z.string().nullable(),
+    steps: z.number().int(),
+});
+
+const reviewChunkOutputSchema = z.object({
+    reviewId: z.string(),
+    step: z.number().int(),
+    stepDescription: z.string(),
+    file: z.string(),
+    verdict: z.enum(VERDICTS),
+    stepStatus: z.enum(STEP_STATUSES),
+    validated: z.number().int(),
+    total: z.number().int(),
+    findings: z.array(findingSchema),
+    patches: z.array(z.object({ line: z.number().int(), search: z.string(), replace: z.string(), reason: z.string() })),
+    context: z.array(z.object({
+        name: z.string(),
+        kind: z.string(),
+        startLine: z.number().int(),
+        endLine: z.number().int(),
+        references: z.number().int(),
+        impactSymbols: z.number().int(),
+        impactFiles: z.number().int(),
+        callers: z.array(z.string()),
+    })),
+});
+
+const reviewStatusOutputSchema = z.object({
+    reviews: z.array(z.object({
+        reviewId: z.string(),
+        root: z.string(),
+        profile: z.string().nullable(),
+        status: z.enum(REVIEW_STATUSES),
+        validated: z.number().int(),
+        total: z.number().int(),
+        updatedAt: z.string(),
+        steps: z.array(z.object({
+            step: z.number().int(),
+            description: z.string(),
+            status: z.string(),
+            chunks: z.number().int(),
+            lastVerdict: z.string().nullable(),
+            openFindings: z.array(findingSchema),
+        })).optional(),
     })),
 });
 
@@ -246,10 +357,12 @@ function parseRetrievalFilters(
 
 export function createServer(): McpServer {
     const codeEnabled = codeIndexEnabled();
+    const profiles = loadReviewProfiles();
+    const startInputSchema = reviewStartInputSchema(profiles);
     const server = new McpServer(
         { name: SERVER_NAME, version: packageVersion, title: SERVER_TITLE },
         {
-            instructions: codeEnabled ? `${SERVER_INSTRUCTIONS} ${CODE_INSTRUCTIONS}` : SERVER_INSTRUCTIONS,
+            instructions: [SERVER_INSTRUCTIONS, codeEnabled ? CODE_INSTRUCTIONS : null, REVIEW_INSTRUCTIONS].filter(Boolean).join(" "),
             capabilities: { logging: {} },
         }
     );
@@ -466,6 +579,91 @@ export function createServer(): McpServer {
             })
         );
     }
+
+    server.registerTool(
+        "review_start",
+        {
+            title: "Start Review",
+            description: "Start a code review from plan steps; returns the lens.",
+            inputSchema: startInputSchema,
+            outputSchema: reviewStartOutputSchema,
+            annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+        },
+        guarded("review_start", startInputSchema, async ({ steps: rawSteps, profile: profileId, root }) => {
+            const steps = rawSteps.map((step) => step.trim());
+            if (steps.length > MAX_REVIEW_STEPS) {
+                return errorResult(`Error: a review takes at most ${MAX_REVIEW_STEPS} steps.`);
+            }
+            if (steps.some((step) => step.length === 0)) {
+                return errorResult("Error: 'steps' must be non-empty strings.");
+            }
+            const profile = profileId === undefined ? defaultReviewProfile(profiles) : profiles.find((candidate) => candidate.id === profileId);
+            if (!profile && profileId !== undefined) {
+                return errorResult(`Error: unknown profile '${profileId}'.`);
+            }
+            const [reviewRoot] = await resolveCodeRoots(server.server, root);
+            if (!reviewRoot) {
+                return errorResult("Error: no project root found. Pass 'root' as an absolute project path or set LATENTCONTEXT_CODE_ROOT.");
+            }
+            const reviewId = startReview(reviewRoot, steps, profile);
+            return textResult(formatReviewStart(reviewId, reviewRoot, steps, profile), {
+                reviewId,
+                root: reviewRoot,
+                profile: profile?.id ?? null,
+                steps: steps.length,
+            });
+        })
+    );
+
+    server.registerTool(
+        "review_chunk",
+        {
+            title: "Review Chunk",
+            description: "Check a code chunk for a review step; verdict and fixes.",
+            inputSchema: reviewChunkInputSchema,
+            outputSchema: reviewChunkOutputSchema,
+            annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+        },
+        guarded("review_chunk", reviewChunkInputSchema, async ({ review_id: reviewId, step, file, code, symbol, findings }) => {
+            if (code.trim().length === 0) {
+                return errorResult("Error: 'code' must be a non-empty string.");
+            }
+            const review = requireReview(reviewId);
+            const path = reviewFilePath(review.root, file);
+            const index = codeEnabled ? (await getCodeIndexes([review.root]))[0] : undefined;
+            const result = await reviewChunk(review, path, { step, code, symbol, findings }, index);
+            return textResult(formatChunkReview(result), { ...result });
+        })
+    );
+
+    server.registerTool(
+        "review_status",
+        {
+            title: "Review Status",
+            description: "List live reviews or show one review's step progress.",
+            inputSchema: reviewStatusInputSchema,
+            outputSchema: reviewStatusOutputSchema,
+            annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+        },
+        guarded("review_status", reviewStatusInputSchema, async ({ review_id: reviewId }) => {
+            const reviews = reviewSummaries(reviewId);
+            return textResult(formatReviewSummaries(reviews), { reviews });
+        })
+    );
+
+    server.registerTool(
+        "review_end",
+        {
+            title: "End Review",
+            description: "Delete a review and its chunk history.",
+            inputSchema: reviewIdInputSchema,
+            annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+        },
+        guarded("review_end", reviewIdInputSchema, async ({ review_id: reviewId }) => {
+            endReview(reviewId);
+            return textResult(`Deleted review ${reviewId}.`);
+        })
+    );
 
     // ── Resources ──────────────────────────────────────────────────────────
 

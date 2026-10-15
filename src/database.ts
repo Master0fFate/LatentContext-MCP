@@ -73,6 +73,37 @@ export interface SessionRow {
     metadata: string; // JSON
 }
 
+export interface ReviewRow {
+    id: string;
+    root: string;
+    profile: string | null;
+    created_at: string;
+    updated_at: string;
+}
+
+export interface ReviewSummaryRow extends ReviewRow {
+    total: number;
+    validated: number;
+}
+
+export interface ReviewStepRow {
+    step: number;
+    description: string;
+    status: string;
+    chunks: number;
+    last_verdict: string | null;
+    last_findings: string | null;
+}
+
+export interface ReviewChunkInput {
+    reviewId: string;
+    step: number;
+    file: string;
+    verdict: string;
+    findings: string;
+    stepStatus: string;
+}
+
 // ---------------------------------------------------------------------------
 // Schema
 // ---------------------------------------------------------------------------
@@ -138,6 +169,32 @@ CREATE TABLE IF NOT EXISTS sessions (
     ended_at TEXT,
     metadata TEXT NOT NULL DEFAULT '{}'
 );
+
+CREATE TABLE IF NOT EXISTS reviews (
+    id TEXT PRIMARY KEY,
+    root TEXT NOT NULL,
+    profile TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS review_steps (
+    review_id TEXT NOT NULL,
+    step INTEGER NOT NULL,
+    description TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'PENDING',
+    PRIMARY KEY (review_id, step)
+);
+
+CREATE TABLE IF NOT EXISTS review_chunks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    review_id TEXT NOT NULL,
+    step INTEGER NOT NULL,
+    file TEXT NOT NULL,
+    verdict TEXT NOT NULL,
+    findings TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL
+);
 `;
 
 const INDEXES_SQL = `
@@ -152,6 +209,8 @@ CREATE INDEX IF NOT EXISTS idx_vectors_source ON vectors(source_id);
 CREATE INDEX IF NOT EXISTS idx_vectors_source_type ON vectors(source_type);
 CREATE INDEX IF NOT EXISTS idx_access_log_memory ON access_log(memory_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at);
+CREATE INDEX IF NOT EXISTS idx_reviews_updated ON reviews(updated_at);
+CREATE INDEX IF NOT EXISTS idx_review_chunks_step ON review_chunks(review_id, step);
 `;
 
 // ---------------------------------------------------------------------------
@@ -769,6 +828,9 @@ export function wipeAllData(): void {
     runSql("DELETE FROM summaries");
     runSql("DELETE FROM entities");
     runSql("DELETE FROM sessions");
+    runSql("DELETE FROM review_chunks");
+    runSql("DELETE FROM review_steps");
+    runSql("DELETE FROM reviews");
 }
 
 // ---------------------------------------------------------------------------
@@ -829,4 +891,65 @@ export function getActiveSession(): SessionRow | undefined {
     return queryOne<SessionRow>(
         "SELECT * FROM sessions WHERE ended_at IS NULL ORDER BY started_at DESC LIMIT 1"
     );
+}
+
+export function insertReview(review: ReviewRow, steps: readonly string[], expiredBefore: string): void {
+    withDatabaseTransaction(() => {
+        const expired = "review_id IN (SELECT id FROM reviews WHERE updated_at < ?)";
+        runSql(`DELETE FROM review_chunks WHERE ${expired}`, [expiredBefore]);
+        runSql(`DELETE FROM review_steps WHERE ${expired}`, [expiredBefore]);
+        runSql("DELETE FROM reviews WHERE updated_at < ?", [expiredBefore]);
+        runSql(
+            "INSERT INTO reviews (id, root, profile, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            [review.id, review.root, review.profile, review.created_at, review.updated_at]
+        );
+        steps.forEach((description, index) => {
+            runSql("INSERT INTO review_steps (review_id, step, description) VALUES (?, ?, ?)", [review.id, index + 1, description]);
+        });
+    });
+}
+
+export function getReview(id: string, since: string): ReviewRow | undefined {
+    return queryOne<ReviewRow>("SELECT * FROM reviews WHERE id = ? AND updated_at >= ?", [id, since]);
+}
+
+export function getReviewSummaries(since: string, limit: number, id?: string): ReviewSummaryRow[] {
+    return queryAll<ReviewSummaryRow>(
+        `SELECT r.*, COUNT(s.step) AS total, COALESCE(SUM(s.status = 'VALIDATED'), 0) AS validated
+     FROM reviews r JOIN review_steps s ON s.review_id = r.id
+     WHERE r.updated_at >= ?${id === undefined ? "" : " AND r.id = ?"}
+     GROUP BY r.id ORDER BY r.updated_at DESC LIMIT ?`,
+        id === undefined ? [since, limit] : [since, id, limit]
+    );
+}
+
+export function getReviewSteps(reviewId: string): ReviewStepRow[] {
+    return queryAll<ReviewStepRow>(
+        `SELECT s.step, s.description, s.status,
+            (SELECT COUNT(*) FROM review_chunks c WHERE c.review_id = s.review_id AND c.step = s.step) AS chunks,
+            (SELECT verdict FROM review_chunks c WHERE c.review_id = s.review_id AND c.step = s.step ORDER BY c.id DESC LIMIT 1) AS last_verdict,
+            (SELECT findings FROM review_chunks c WHERE c.review_id = s.review_id AND c.step = s.step ORDER BY c.id DESC LIMIT 1) AS last_findings
+     FROM review_steps s WHERE s.review_id = ? ORDER BY s.step`,
+        [reviewId]
+    );
+}
+
+export function recordReviewChunk(chunk: ReviewChunkInput): void {
+    const ts = now();
+    withDatabaseTransaction(() => {
+        runSql(
+            "INSERT INTO review_chunks (review_id, step, file, verdict, findings, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            [chunk.reviewId, chunk.step, chunk.file, chunk.verdict, chunk.findings, ts]
+        );
+        runSql("UPDATE review_steps SET status = ? WHERE review_id = ? AND step = ?", [chunk.stepStatus, chunk.reviewId, chunk.step]);
+        runSql("UPDATE reviews SET updated_at = ? WHERE id = ?", [ts, chunk.reviewId]);
+    });
+}
+
+export function deleteReview(id: string): void {
+    withDatabaseTransaction(() => {
+        runSql("DELETE FROM review_chunks WHERE review_id = ?", [id]);
+        runSql("DELETE FROM review_steps WHERE review_id = ?", [id]);
+        runSql("DELETE FROM reviews WHERE id = ?", [id]);
+    });
 }

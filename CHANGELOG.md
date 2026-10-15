@@ -4,6 +4,23 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [2.2.0] - 2026-10-15
+
+### Added
+
+- Code review tools ported from codeviewer-mcp and merged from eight tools
+  into four: `review_start`, `review_chunk`, `review_status`, and
+  `review_end`.
+- `review_chunk` merges the model's own findings with tree-sitter syntax
+  errors for all 19 indexed languages, language-aware security rules, and
+  leftover debug statements. It returns a verdict, drop-in patch hints, and
+  caller references and impact from the code index, and it tracks each plan
+  step's status.
+- Four review lenses ship in `prompts/`. `review_start` returns the chosen
+  lens text, and `LATENTCONTEXT_REVIEW_PROFILES` points at a custom set.
+- Reviews persist in the existing SQLite database and expire 7 days after
+  their last update.
+
 ## [2.1.1] - 2026-10-15
 
 ### Fixed
