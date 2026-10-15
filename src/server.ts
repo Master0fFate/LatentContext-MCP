@@ -13,6 +13,8 @@ import {
     clearWorkingMemory,
 } from "./memory-manager.js";
 import { assembleContext, type RetrievalFilters } from "./context-assembler.js";
+import { explore } from "./code-explore.js";
+import { codeIndexEnabled, getCodeIndexes, resolveCodeRoots, watchClientRoots } from "./code-workspace.js";
 import { getGraphSchema } from "./knowledge-graph.js";
 import { log } from "./logger.js";
 import { startSession, getSessionInfo } from "./session.js";
@@ -43,6 +45,11 @@ export const SERVER_INSTRUCTIONS = [
     "Use memory_retrieve before relying on earlier context; results are limited to the active session and the requested token budget.",
     "Use memory_compress when working memory grows large, memory_forget to deprecate, correct, or delete a note, and memory_status to inspect storage.",
 ].join(" ");
+
+const CODE_INSTRUCTIONS = "Call code_explore before reading or editing source files: one call with symbol names, file names, or a plain question returns the line-numbered source of the matching symbols plus their call paths, references, callees, and impact, so treat the shown source as already read.";
+
+export const DEFAULT_EXPLORE_FILES = 10;
+export const DEFAULT_EXPLORE_TOKENS = 8000;
 
 // ---------------------------------------------------------------------------
 // Schemas
@@ -87,6 +94,26 @@ const forgetInputSchema = z.object({
     action: z.enum(FORGET_ACTIONS).describe("Update action."),
     correction: z.string().min(1).optional().describe("Replacement text; required when action is 'correct'."),
 }).strict();
+
+const exploreInputSchema = z.object({
+    query: z.string().min(1).describe("Symbol names, file names, or a question about the code."),
+    root: z.string().min(1).optional().describe("Absolute project directory. Defaults to the client roots."),
+    max_files: z.number().int().min(1).max(30).optional().describe(`Maximum files with source (default ${DEFAULT_EXPLORE_FILES}).`),
+    token_budget: z.number().int().min(500).max(64000).optional().describe(`Maximum response tokens (default ${DEFAULT_EXPLORE_TOKENS}).`),
+}).strict();
+
+const exploreOutputSchema = z.object({
+    roots: z.array(z.string()),
+    indexedFiles: z.number().int(),
+    indexedSymbols: z.number().int(),
+    symbols: z.array(z.object({
+        name: z.string(),
+        kind: z.string(),
+        file: z.string(),
+        startLine: z.number().int(),
+        endLine: z.number().int(),
+    })),
+});
 
 const sessionStartOutputSchema = z.object({
     sessionId: z.string(),
@@ -218,10 +245,11 @@ function parseRetrievalFilters(
 // ---------------------------------------------------------------------------
 
 export function createServer(): McpServer {
+    const codeEnabled = codeIndexEnabled();
     const server = new McpServer(
         { name: SERVER_NAME, version: packageVersion, title: SERVER_TITLE },
         {
-            instructions: SERVER_INSTRUCTIONS,
+            instructions: codeEnabled ? `${SERVER_INSTRUCTIONS} ${CODE_INSTRUCTIONS}` : SERVER_INSTRUCTIONS,
             capabilities: { logging: {} },
         }
     );
@@ -405,6 +433,39 @@ export function createServer(): McpServer {
             });
         })
     );
+
+    if (codeEnabled) {
+        watchClientRoots(server.server);
+        server.registerTool(
+            "code_explore",
+            {
+                title: "Explore Code",
+                description: "Find code by names or question; source plus call graph.",
+                inputSchema: exploreInputSchema,
+                outputSchema: exploreOutputSchema,
+                annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+            },
+            guarded("code_explore", exploreInputSchema, async ({ query, root, max_files: maxFiles, token_budget: tokenBudget }) => {
+                if (query.trim().length === 0) {
+                    return errorResult("Error: 'query' must be a non-empty string.");
+                }
+                const roots = await resolveCodeRoots(server.server, root);
+                if (roots.length === 0) {
+                    return errorResult("Error: no project root found. Pass 'root' as an absolute project path or set LATENTCONTEXT_CODE_ROOT.");
+                }
+                const result = explore(await getCodeIndexes(roots), query, {
+                    maxFiles: maxFiles ?? DEFAULT_EXPLORE_FILES,
+                    tokenBudget: tokenBudget ?? DEFAULT_EXPLORE_TOKENS,
+                });
+                return textResult(result.text, {
+                    roots,
+                    indexedFiles: result.indexedFiles,
+                    indexedSymbols: result.indexedSymbols,
+                    symbols: result.symbols,
+                });
+            })
+        );
+    }
 
     // ── Resources ──────────────────────────────────────────────────────────
 

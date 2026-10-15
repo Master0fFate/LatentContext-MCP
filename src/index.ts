@@ -2,6 +2,7 @@
 
 import { spawn } from "node:child_process";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { closeCodeIndexes, codeIndexEnabled, warmCodeIndexes } from "./code-workspace.js";
 import { getConfigSource, loadConfig } from "./config.js";
 import { closeDatabase, initDatabase } from "./database.js";
 import { captureProcessOutput, initLogFile, log, setLogSink } from "./logger.js";
@@ -82,6 +83,9 @@ async function main(): Promise<void> {
                 .sendLoggingMessage({ level, logger: "latentcontext", data: { message, ...data } })
                 .catch(() => undefined);
         }, "info");
+        if (codeIndexEnabled()) {
+            warmCodeIndexes(server.server).catch((error: unknown) => log("warning", "Code index warmup failed", error));
+        }
     };
 
     // 6. Graceful shutdown. Never call process.exit() while the transport is
@@ -101,6 +105,8 @@ async function main(): Promise<void> {
             // The durable checkpoint is retained for recovery on next boot.
             log("error", "Error archiving and ending session", error);
         }
+
+        closeCodeIndexes();
 
         try {
             closeDatabase();

@@ -107,6 +107,7 @@ test("MCP stdio discovery and session memory workflow remain JSON-RPC-safe", asy
         const discovery = await client.listTools(undefined, CALL_OPTIONS);
         const tools = new Map(discovery.tools.map((tool) => [tool.name, tool]));
         assert.deepEqual([...tools.keys()].sort(), [
+            "code_explore",
             "memory_compress",
             "memory_forget",
             "memory_retrieve",
@@ -123,6 +124,7 @@ test("MCP stdio discovery and session memory workflow remain JSON-RPC-safe", asy
                 memory_compress: "Compress active-session memory at a selected scope.",
                 memory_forget: "Deprecate, correct, or delete a memory.",
                 memory_status: "Show memory storage and session status.",
+                code_explore: "Find code by names or question; source plus call graph.",
             }
         );
         for (const tool of tools.values()) {
@@ -145,6 +147,7 @@ test("MCP stdio discovery and session memory workflow remain JSON-RPC-safe", asy
                 memory_compress: false,
                 memory_forget: false,
                 memory_status: true,
+                code_explore: true,
             }
         );
         assert.equal(tools.get("memory_compress")?.annotations?.destructiveHint, true);

@@ -4,6 +4,29 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [2.1.0] - 2026-10-15
+
+### Added
+
+- `code_explore` tool. It indexes the project with tree-sitter and answers
+  symbol names, file names, or plain questions with line-numbered source,
+  call paths, references, callees, and an impact count in one call.
+- Support for 19 languages: TypeScript, TSX, JavaScript, Python, Rust, Go,
+  Java, C#, C, C++, Ruby, PHP, Kotlin, Scala, Lua, Zig, Elixir, Bash, and
+  PowerShell.
+- Scanning and parsing run on a worker-thread pool. Nested `.gitignore` files
+  are honoured, and common dependency and cache directories are skipped.
+- The index stays current through native file watchers and re-parses only
+  changed files. It persists as a v8 snapshot under `code-index/` in the data
+  directory.
+- Project roots come from the `root` argument, `LATENTCONTEXT_CODE_ROOT`, the
+  client's MCP roots, or a project-like working directory.
+- `LATENTCONTEXT_CODE_INDEX=0` disables the code index.
+
+### Changed
+
+- The README was rewritten around memory and code intelligence.
+
 ## [2.0.0] - 2026-10-10
 
 ### Breaking changes
@@ -75,4 +98,5 @@ All notable changes to this project are documented here. The format follows
 
 - Storage isolation and stdio hardening.
 
+[2.1.0]: https://github.com/Master0fFate/LatentContext-MCP/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/Master0fFate/LatentContext-MCP/compare/v1.2.0...v2.0.0

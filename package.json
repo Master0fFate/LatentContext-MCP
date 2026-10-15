@@ -1,7 +1,7 @@
 {
     "name": "latentcontext-mcp",
-    "version": "2.0.0",
-    "description": "LatentContext MCP Server: session-isolated memory, summaries, and a knowledge graph for MCP hosts",
+    "version": "2.1.0",
+    "description": "LatentContext MCP Server: session-isolated memory, a knowledge graph, and a live code index with call graphs for MCP hosts",
     "type": "module",
     "main": "dist/index.js",
     "types": "dist/index.d.ts",
@@ -10,6 +10,7 @@
     },
     "files": [
         "dist",
+        "grammars",
         "README.md",
         "LICENSE"
     ],
@@ -50,12 +51,17 @@
         "knowledge-graph",
         "vector-search",
         "claude",
-        "cursor"
+        "cursor",
+        "code-search",
+        "code-intelligence",
+        "call-graph",
+        "tree-sitter"
     ],
     "license": "MIT",
     "dependencies": {
         "@huggingface/transformers": "^4.3.1",
         "@modelcontextprotocol/sdk": "^1.32.1",
+        "@vscode/tree-sitter-wasm": "^0.3.1",
         "js-tiktoken": "^1.0.21",
         "sql.js": "^1.14.2",
         "zod": "^4.6.5"
