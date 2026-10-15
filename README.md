@@ -302,12 +302,13 @@ Runtime state is project-local by default:
 
 ```text
 <launched-project>/.latentcontext/
+├── .gitignore      # "*" so the folder never reaches git
 ├── memory.db
 ├── server.log
 └── code-index/
 ```
 
-`<launched-project>` is the working directory of the server process. To share memory across projects, set `LATENTCONTEXT_DATA_DIR`:
+`<launched-project>` is the working directory of the server process. The folder ignores itself, so no repository needs a `.gitignore` entry for it. To share memory across projects, set `LATENTCONTEXT_DATA_DIR`:
 
 ```json
 {

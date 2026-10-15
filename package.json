@@ -1,6 +1,6 @@
 {
     "name": "latentcontext-mcp",
-    "version": "2.1.0",
+    "version": "2.1.1",
     "description": "LatentContext MCP Server: session-isolated memory, a knowledge graph, and a live code index with call graphs for MCP hosts",
     "type": "module",
     "main": "dist/index.js",

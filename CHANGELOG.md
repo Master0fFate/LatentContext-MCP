@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [2.1.1] - 2026-10-15
+
+### Fixed
+
+- The data directory now gets its own `.gitignore` containing `*`, so a
+  project-local `.latentcontext/` never shows up in `git status`. An existing
+  `.gitignore` in that directory is left untouched.
+
 ## [2.1.0] - 2026-10-15
 
 ### Added
@@ -98,5 +106,6 @@ All notable changes to this project are documented here. The format follows
 
 - Storage isolation and stdio hardening.
 
+[2.1.1]: https://github.com/Master0fFate/LatentContext-MCP/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/Master0fFate/LatentContext-MCP/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/Master0fFate/LatentContext-MCP/compare/v1.2.0...v2.0.0

@@ -1,8 +1,8 @@
 import initSqlJs from "sql.js";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, renameSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { createRequire } from "node:module";
-import { getConfig } from "./config.js";
+import { ensureDataDir, getConfig } from "./config.js";
 
 type SqlJsDatabase = initSqlJs.Database;
 /** Values sql.js can bind to a prepared statement. */
@@ -173,9 +173,7 @@ export async function initDatabase(): Promise<SqlJsDatabase> {
     const config = getConfig();
     const dataDir = config.storage.dataDir;
 
-    if (!existsSync(dataDir)) {
-        mkdirSync(dataDir, { recursive: true });
-    }
+    ensureDataDir(dataDir);
 
     _dbPath = join(dataDir, config.storage.sqliteFile);
 

@@ -1,4 +1,4 @@
-import { readFileSync, existsSync } from "fs";
+import { readFileSync, existsSync, mkdirSync, writeFileSync } from "fs";
 import { basename, dirname, isAbsolute, join, resolve } from "path";
 import { fileURLToPath } from "url";
 
@@ -228,6 +228,12 @@ export function loadConfig(configPath?: string): LatentContextConfig {
     }
 
     return _config;
+}
+
+export function ensureDataDir(dataDir: string): void {
+    mkdirSync(dataDir, { recursive: true });
+    const ignoreFile = join(dataDir, ".gitignore");
+    if (!existsSync(ignoreFile)) writeFileSync(ignoreFile, "*\n");
 }
 
 export function getConfig(): LatentContextConfig {
